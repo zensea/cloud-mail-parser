@@ -165,7 +165,7 @@ export async function email(message, env, ctx) {
 
 		// The durable job is registered before the email event finishes. Cron repairs gaps.
 		try {
-			if (await parserService.receive(env.db, emailRow)) {
+            if (await parserService.receive(env.db, emailRow, { env, attachments })) {
 				ctx.waitUntil(parserService.process(env.db, { userId: emailRow.userId })
 					.catch(error => console.error('Parser background task failed', error)));
 			}

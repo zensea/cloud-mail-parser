@@ -1,9 +1,12 @@
 import { RE2JS } from 're2js';
 import { parseHTML } from 'linkedom';
+import { extractTable, applyTableFilter } from './parser-table';
 
 export const PARSER_LIMITS = Object.freeze({ fields: 30, filters: 12, pattern: 256, inputBytes: 131072, value: 8192 });
-export const PARSER_SOURCES = ['subject', 'text', 'htmlText', 'from', 'to'];
+export const PARSER_SOURCES = ['subject', 'text', 'htmlText', 'from', 'to', 'htmlTable', 'csvAttachment'];
 export const PARSER_FILTERS = ['between', 'regex', 'replace', 'trim', 'collapse', 'lower', 'upper', 'default', 'number', 'date'];
+export const TABLE_FILTERS = ['tableRows', 'tableColumns', 'tableTrim'];
+export const isTableSource = source => ['htmlTable', 'csvAttachment'].includes(source);
 const encoder = new TextEncoder();
 
 export function checkSize(value, limit = PARSER_LIMITS.inputBytes) {
@@ -43,10 +46,23 @@ export function validateRules(rules) {
         }
         keys.add(rule.key);
         if (!PARSER_SOURCES.includes(rule.source)) throw new Error(`Invalid source for ${rule.key}`);
+        const table = isTableSource(rule.source);
+        if (table) {
+            const options = rule.options;
+            if (!options || typeof options.hasHeader !== 'boolean') throw new Error('Select whether the table has a header row');
+            if (rule.source === 'htmlTable' && (!Number.isInteger(options.tableIndex) || options.tableIndex < 1 || options.tableIndex > 20)) throw new Error('HTML table index must be between 1 and 20');
+            if (rule.source === 'csvAttachment') {
+                boundedString(options.attachmentName, 255, 'CSV attachment name');
+                if (!options.attachmentName || !options.attachmentName.toLowerCase().endsWith('.csv')) throw new Error('An exact .csv attachment name is required');
+                if (![',', ';', '\t'].includes(options.delimiter)) throw new Error('Unsupported CSV delimiter');
+            }
+        }
         if (rule.required !== undefined && typeof rule.required !== 'boolean') throw new Error('Required must be a boolean');
         if (!Array.isArray(rule.filters) || rule.filters.length > PARSER_LIMITS.filters) throw new Error('Use at most 12 filters per field');
         for (const filter of rule.filters) {
-            if (!filter || !PARSER_FILTERS.includes(filter.type)) throw new Error('Unknown filter');
+            if (!filter || !(table ? TABLE_FILTERS : PARSER_FILTERS).includes(filter.type)) throw new Error('Filter does not match the selected data source');
+            if (filter.type === 'tableRows' && (!Number.isInteger(filter.start) || !Number.isInteger(filter.end) || filter.start < 1 || filter.end < filter.start || filter.end > 200)) throw new Error('Table row range must be between 1 and 200');
+            if (filter.type === 'tableColumns' && (!Array.isArray(filter.columns) || !filter.columns.length || filter.columns.length > 50 || filter.columns.some(column => typeof column !== 'string' || !column || column.length > 128) || new Set(filter.columns).size !== filter.columns.length)) throw new Error('Select unique table column names');
             if (filter.type === 'regex') compile(filter);
             if (filter.type === 'between') {
                 boundedString(filter.start ?? '', 512, 'start marker');
@@ -64,10 +80,13 @@ export function validateRules(rules) {
             }
         }
     }
+    if (new Set(rules.filter(rule => rule.source === 'csvAttachment').map(rule => rule.options.attachmentName)).size > 5) throw new Error('Use at most 5 CSV attachments per email');
     // Persist only supported properties, keeping unknown input out of snapshots.
-    return rules.map(rule => ({ key: rule.key, source: rule.source, required: !!rule.required, filters: rule.filters.map(filter => {
+    return rules.map(rule => ({ key: rule.key, source: rule.source, required: !!rule.required,
+        ...(isTableSource(rule.source) ? { options: { hasHeader: rule.options.hasHeader, ...(rule.source === 'htmlTable' ? { tableIndex: rule.options.tableIndex } : { attachmentName: rule.options.attachmentName, delimiter: rule.options.delimiter }) } } : {}),
+        filters: rule.filters.map(filter => {
         const value = { type: filter.type };
-        const properties = { between: ['start', 'end'], regex: ['pattern', 'flags', 'group'], replace: ['search', 'replacement'], default: ['value'], date: ['inputFormat'] }[filter.type] || [];
+        const properties = { between: ['start', 'end'], regex: ['pattern', 'flags', 'group'], replace: ['search', 'replacement'], default: ['value'], date: ['inputFormat'], tableRows: ['start', 'end'], tableColumns: ['columns'] }[filter.type] || [];
         for (const key of properties) if (filter[key] !== undefined) value[key] = filter[key];
         return value;
     }) }));
@@ -78,6 +97,15 @@ export function emailInput(email) {
         subject: String(email.subject ?? ''), text: String(email.text ?? ''), html: String(email.html ?? email.content ?? ''),
         from: String(email.from ?? email.sendEmail ?? ''), to: String(email.to ?? email.toEmail ?? '')
     };
+    if (email.attachments !== undefined) {
+        if (!Array.isArray(email.attachments) || email.attachments.length > 5) throw new Error('Use at most 5 CSV attachments per email');
+        input.attachments = email.attachments.map(file => {
+            boundedString(file?.name, 255, 'attachment name');
+            boundedString(file?.text, 65536, 'CSV attachment text');
+            checkSize(file.text, 65536);
+            return { name: file.name, text: file.text };
+        });
+    } else input.attachments = [];
     checkSize(input);
     return input;
 }
@@ -147,22 +175,24 @@ export function parseEmail(rules, email, trace = false) {
     const fields = [];
     let traceBytes = 0;
     const addStep = (steps, type, value) => {
-        traceBytes += encoder.encode(String(value)).byteLength;
+        traceBytes += encoder.encode(typeof value === 'string' ? value : JSON.stringify(value)).byteLength;
         if (traceBytes > 900000) throw new Error('Preview trace exceeds the size limit');
         steps.push({ type, value });
     };
     for (const rule of normalized) {
-        let value = rule.source === 'htmlText' ? (extractedHtml ??= htmlText(input.html)) : input[rule.source];
+        const table = isTableSource(rule.source);
+        let value;
         const steps = [];
-        if (trace) addStep(steps, 'source', value);
         try {
+            value = table ? extractTable(rule, input) : rule.source === 'htmlText' ? (extractedHtml ??= htmlText(input.html)) : input[rule.source];
+            if (trace) addStep(steps, 'source', value);
             for (const filter of rule.filters) {
-                value = applyFilter(value, filter);
-                checkSize(String(value));
+                value = table ? applyTableFilter(value, filter) : applyFilter(value, filter);
+                checkSize(value);
                 if (trace) addStep(steps, filter.type, value);
             }
-            if (String(value).length > PARSER_LIMITS.value) throw new Error('Field output exceeds 8192 characters');
-            if (rule.required && !String(value).trim()) throw new Error('Required field is empty');
+            if (!table && String(value).length > PARSER_LIMITS.value) throw new Error('Field output exceeds 8192 characters');
+            if (rule.required && (table ? !value.length : !String(value).trim())) throw new Error('Required field is empty');
             data[rule.key] = value;
         } catch (error) {
             data[rule.key] = null;
@@ -171,18 +201,37 @@ export function parseEmail(rules, email, trace = false) {
         if (trace) fields.push({ key: rule.key, steps });
     }
     checkSize(data);
+    if (trace && traceBytes > 900000) throw new Error('Preview trace exceeds the size limit');
     if (trace) checkSize(fields, 1048576);
     return { data, errors, ...(trace ? { fields } : {}) };
 }
 
-export function csvExport(rows) {
-    const keys = [...new Set(rows.flatMap(row => Object.keys(row.data)))];
+export function csvExport(rows, tableField = '') {
+    const keys = new Set();
+    for (const row of rows) {
+        for (const key of Object.keys(row.data)) if (key !== tableField) keys.add(key);
+        if (tableField) {
+            if (!Array.isArray(row.data[tableField])) throw new Error('Selected export field is not a table');
+            for (const record of row.data[tableField]) for (const column of Object.keys(record)) keys.add(`${tableField}.${column}`);
+        }
+    }
+    const columns = [...keys];
     const escape = value => {
-        let text = String(value ?? '');
+        let text = value !== null && typeof value === 'object' ? JSON.stringify(value) : String(value ?? '');
         if (/^[\s]*[=+\-@\t\r\n]/.test(text)) text = `'${text}`;
         return `"${text.replace(/"/g, '""')}"`;
     };
-    const header = ['_job_id', '_email_id', '_version', '_parsed_at', ...keys];
-    return '\uFEFF' + [header, ...rows.map(row => [row.id, row.emailId, row.version, row.parsedAt, ...keys.map(key => row.data[key])])]
-        .map(row => row.map(escape).join(',')).join('\r\n');
+    const lines = [];
+    let bytes = 3;
+    const append = cells => {
+        const line = cells.map(escape).join(',');
+        bytes += encoder.encode(line).byteLength + 2;
+        if (bytes > 4194304) throw new Error('CSV export exceeds 4 MiB; reduce the result batch');
+        lines.push(line);
+    };
+    append(['_job_id', '_email_id', '_version', '_parsed_at', ...columns]);
+    for (const row of rows) for (const record of tableField ? row.data[tableField] : [null]) {
+        append([row.id, row.emailId, row.version, row.parsedAt, ...columns.map(key => tableField && key.startsWith(`${tableField}.`) ? record[key.slice(tableField.length + 1)] : row.data[key])]);
+    }
+    return '\uFEFF' + lines.join('\r\n');
 }

@@ -7,6 +7,7 @@ export const parserSchema = [
         name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0, version INTEGER NOT NULL DEFAULT 1,
         rules_json TEXT NOT NULL, webhook_url TEXT NOT NULL DEFAULT '', webhook_secret TEXT NOT NULL DEFAULT '',
         start_email_id INTEGER NOT NULL DEFAULT 0, last_scanned_at INTEGER NOT NULL DEFAULT 0,
+        retention_days INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(user_id, account_id)
     )`,
     `CREATE INDEX IF NOT EXISTS idx_parser_config_scan ON parser_config(enabled, last_scanned_at)`,
@@ -28,6 +29,7 @@ export const parserSchema = [
     `CREATE INDEX IF NOT EXISTS idx_parser_job_export ON parser_job(user_id, parser_id, status, parsed_at, id)`,
     `CREATE INDEX IF NOT EXISTS idx_parser_job_parse ON parser_job(status, available_at, lease_until)`,
     `CREATE INDEX IF NOT EXISTS idx_parser_job_dispatch ON parser_job(dispatch_status, dispatch_available_at, dispatch_lease_until)`,
+    `CREATE INDEX IF NOT EXISTS idx_parser_job_retention ON parser_job(status, updated_at)`,
     `CREATE TABLE IF NOT EXISTS parser_delivery (
         id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER NOT NULL REFERENCES parser_job(id) ON DELETE CASCADE, user_id INTEGER NOT NULL,
         attempt INTEGER NOT NULL, status_code INTEGER, error TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL
@@ -37,4 +39,8 @@ export const parserSchema = [
 
 export async function initParserSchema(db) {
     await db.batch(parserSchema.map(sql => db.prepare(sql)));
+    const { results } = await db.prepare('PRAGMA table_info(parser_config)').all();
+    if (!results.some(column => column.name === 'retention_days')) {
+        await db.prepare('ALTER TABLE parser_config ADD COLUMN retention_days INTEGER NOT NULL DEFAULT 0').run();
+    }
 }

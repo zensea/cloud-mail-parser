@@ -10,10 +10,10 @@ export const parserJobs = (parserId, cursor = 0) => http.get('/parser/jobs', { p
 export const parserJob = id => http.get(`/parser/jobs/${id}`);
 export const parserRetry = (id, kind) => http.post(`/parser/jobs/${id}/retry`, { kind });
 
-export async function parserDownload(parserId, format, cursor) {
+export async function parserDownload(parserId, format, cursor, tableField = '', size = 100) {
     const base = (import.meta.env.VITE_BASE_URL || '').replace(/\/$/, '');
     const url = new URL(`${base}/parser/export`, window.location.origin);
-    url.search = new URLSearchParams({ parserId, format, cursor });
+    url.search = new URLSearchParams({ parserId, format, cursor, tableField, size });
     const response = await fetch(url, { headers: { Authorization: localStorage.getItem('token') || '' }, cache: 'no-store' });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     if (format === 'csv' && response.headers.get('Content-Type')?.includes('text/csv')) {

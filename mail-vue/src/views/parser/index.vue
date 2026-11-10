@@ -9,7 +9,7 @@
     <template v-if="accounts.length">
       <div class="mailbox-bar">
         <label for="parser-mailbox">{{ t('parser.mailbox') }}</label>
-        <el-select id="parser-mailbox" :model-value="selectedAccount" filterable :disabled="busy.saving" @update:model-value="changeAccount">
+        <el-select id="parser-mailbox" :model-value="selectedAccount" filterable :disabled="busy.saving || busy.exporting" @update:model-value="changeAccount">
           <el-option v-for="account in accounts" :key="account.accountId" :value="account.accountId" :label="account.email" />
         </el-select>
         <el-tag v-if="draft.id" type="info">v{{ draft.version }}</el-tag>
@@ -27,8 +27,12 @@
                   <el-switch id="parser-enabled" v-model="draft.enabled" :aria-label="t('parser.enabled')" />
                   <p class="help">{{ t('parser.enabledHelp') }}</p>
                 </el-form-item>
+                <el-form-item :label="t('parser.retentionDays')" for="parser-retention">
+                  <el-input-number id="parser-retention" v-model="draft.retentionDays" :min="0" :max="60" :precision="0" />
+                  <p class="help">{{ t('parser.retentionHelp') }}</p>
+                </el-form-item>
               </el-form>
-              <rule-editor v-model="draft.rules" />
+              <rule-editor v-model="draft.rules" :attachment-names="attachmentNames" />
               <section class="delivery-settings" aria-labelledby="parser-webhook-heading">
                 <h3 id="parser-webhook-heading">{{ t('parser.webhook') }}</h3>
                 <p class="help">{{ t('parser.webhookHelp') }}</p>
@@ -60,6 +64,10 @@
                 <template v-if="!selectedSample">
                   <el-form-item :label="t('parser.subject')" for="parser-sample-subject"><el-input id="parser-sample-subject" v-model="sampleInput.subject" /></el-form-item>
                   <el-form-item :label="t('parser.body')" for="parser-sample-body"><el-input id="parser-sample-body" v-model="sampleInput.text" type="textarea" :rows="7" /></el-form-item>
+                  <template v-if="hasCsvRule">
+                    <el-form-item :label="t('parser.sampleCsvName')" for="parser-csv-name"><el-input id="parser-csv-name" v-model="sampleCsv.name" maxlength="255" /></el-form-item>
+                    <el-form-item :label="t('parser.sampleCsvText')" for="parser-csv-text"><el-input id="parser-csv-text" v-model="sampleCsv.text" type="textarea" :rows="5" /></el-form-item>
+                  </template>
                   <el-collapse>
                     <el-collapse-item :title="t('parser.html')" name="sample-extra">
                       <el-input v-model="sampleInput.html" :aria-label="t('parser.html')" type="textarea" :rows="4" />
@@ -68,6 +76,7 @@
                     </el-collapse-item>
                   </el-collapse>
                 </template>
+                <p v-else class="help">{{ t('parser.csvFiles') }}: {{ attachmentNames.join(', ') || t('parser.unavailable') }}</p>
               </el-form>
               <div class="preview-actions">
                 <el-button type="primary" plain :loading="busy.previewing" @click="runPreview">{{ t('parser.runPreview') }}</el-button>
@@ -76,6 +85,7 @@
               <p class="help">{{ t('parser.submitHelp') }}</p>
               <template v-if="preview">
                 <el-alert :title="t(preview.errors.length ? 'parser.previewInvalid' : 'parser.previewValid')" :type="preview.errors.length ? 'warning' : 'success'" :closable="false" show-icon />
+                <table-results :data="preview.data" />
                 <h4>{{ t('parser.output') }}</h4>
                 <pre class="json-output" aria-live="polite">{{ pretty(preview.data) }}</pre>
                 <ul v-if="preview.errors.length" class="field-errors"><li v-for="item in preview.errors" :key="item.field">{{ item.field }}: {{ item.message }}</li></ul>
@@ -94,6 +104,13 @@
         </el-tab-pane>
         <el-tab-pane :label="t('parser.results')" name="results">
           <div class="results-toolbar">
+            <label for="parser-export-field">{{ t('parser.exportTable') }}</label>
+            <el-select id="parser-export-field" v-model="exportTableField" :empty-values="[null, undefined]" :disabled="busy.exporting" :aria-label="t('parser.exportTable')" style="width: 200px">
+              <el-option value="" :label="t('parser.exportPerEmail')" />
+              <el-option v-for="field in exportTables" :key="field.key" :value="field.key" :label="field.key" />
+            </el-select>
+            <label for="parser-export-size">{{ t('parser.exportSize') }}</label>
+            <el-input-number id="parser-export-size" v-model="exportBatchSize" :disabled="busy.exporting" :min="1" :max="exportTableField ? 10 : 100" :precision="0" />
             <el-button :disabled="!draft.id" :loading="busy.jobs" @click="loadJobs">{{ t('parser.refresh') }}</el-button>
             <el-button v-for="format in ['csv', 'json']" :key="format" :disabled="!draft.id" :loading="busy.exporting" @click="download(format)">
               {{ exportMore[format] ? t('parser.exportNext', { format: format.toUpperCase() }) : t(format === 'csv' ? 'parser.exportCsv' : 'parser.exportJson') }}
@@ -128,6 +145,8 @@
         </el-descriptions>
         <p v-if="detail.error || detail.dispatchError" class="field-errors">{{ detail.error || detail.dispatchError }}</p>
         <ul class="field-errors"><li v-for="item in detail.errors" :key="item.field">{{ item.field }}: {{ item.message }}</li></ul>
+        <p v-if="detail.status === 'expired'" class="help">{{ t('parser.expiredHelp') }}</p>
+        <table-results :data="detail.data" />
         <h4>{{ t('parser.output') }}</h4><pre class="json-output">{{ pretty(detail.data) }}</pre>
         <div class="preview-actions">
           <el-button v-if="detail.status === 'failed'" :loading="busy.retrying" @click="retry('parse')">{{ t('parser.retryParse') }}</el-button>
@@ -153,6 +172,7 @@ import { useI18n } from 'vue-i18n';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { useAccountStore } from '@/store/account.js';
 import RuleEditor from './rule-editor.vue';
+import TableResults from './table-results.vue';
 import { parserAccounts, parserConfigs, parserSave, parserSamples, parserPreview, parserEnqueue, parserJobs, parserJob, parserRetry, parserDownload } from '@/request/parser.js';
 
 const { t } = useI18n();
@@ -163,10 +183,16 @@ const jobs = ref([]), cursor = ref(0), nextCursor = ref(0), cursorStack = ref([]
 const drawerOpen = ref(false), detail = ref(null);
 const exportCursor = reactive({ csv: '0_0', json: '0_0' }), exportMore = reactive({ csv: false, json: false });
 const sampleInput = reactive({ subject: 'Order A-100', text: t('parser.sampleOrder'), html: '', from: '', to: '' });
+const sampleCsv = reactive({ name: 'orders.csv', text: 'item,quantity\nWidget,2\nCable,3' });
+const hasCsvRule = computed(() => draft.value.rules.some(rule => rule.source === 'csvAttachment'));
+const attachmentNames = computed(() => selectedSample.value ? samples.value.find(sample => sample.emailId === selectedSample.value)?.attachmentNames || [] : [sampleCsv.name].filter(Boolean));
+const exportTableField = ref('');
+const exportBatchSize = ref(100);
+const exportTables = computed(() => configs.value.find(config => config.id === draft.value.id)?.rules.filter(rule => ['htmlTable', 'csvAttachment'].includes(rule.source)) || []);
 const dirty = computed(() => baseline.value && JSON.stringify(draft.value) !== baseline.value);
 let poll;
 const pretty = value => value == null ? '—' : JSON.stringify(value, null, 2);
-const tagType = status => ({ parsed: 'success', sent: 'success', failed: 'danger', none: 'info' }[status] || 'warning');
+const tagType = status => ({ parsed: 'success', sent: 'success', failed: 'danger', none: 'info', expired: 'info' }[status] || 'warning');
 
 async function run(key, action) {
   if (busy[key]) return;
@@ -185,12 +211,12 @@ async function selectAccount(accountId) {
   selectedAccount.value = accountId;
   const saved = configs.value.find(config => config.accountId === accountId);
   draft.value = saved ? { ...JSON.parse(JSON.stringify(saved)), webhookSecret: '', clearWebhookSecret: false } : {
-    accountId, name: t('parser.defaultName'), enabled: false, webhookUrl: '', webhookSecret: '', clearWebhookSecret: false,
+    accountId, name: t('parser.defaultName'), enabled: false, retentionDays: 30, webhookUrl: '', webhookSecret: '', clearWebhookSecret: false,
     rules: [{ key: 'order_id', source: 'text', required: true, filters: [{ type: 'regex', pattern: '(?:订单号|Order ID): ([A-Z0-9-]+)', flags: 'm', group: 1 }] }]
   };
   baseline.value = JSON.stringify(draft.value);
   preview.value = null; selectedSample.value = 0; jobs.value = []; cursor.value = 0; cursorStack.value = []; hasMore.value = false;
-  resetExports();
+  exportTableField.value = ''; resetExports();
   samples.value = await parserSamples(accountId);
   if (draft.value.id) await loadJobs();
 }
@@ -225,7 +251,7 @@ async function runPreview() {
 }
 function previewPayload() {
   return { accountId: selectedAccount.value, rules: draft.value.rules,
-    ...(selectedSample.value ? { emailId: selectedSample.value } : { sample: sampleInput }) };
+    ...(selectedSample.value ? { emailId: selectedSample.value } : { sample: { ...sampleInput, attachments: hasCsvRule.value ? [sampleCsv] : [] } }) };
 }
 async function submit() {
   await run('submitting', async () => {
@@ -257,7 +283,7 @@ async function retry(kind) {
 }
 async function download(format) {
   await run('exporting', async () => {
-    const data = await parserDownload(draft.value.id, format, exportCursor[format]);
+    const data = await parserDownload(draft.value.id, format, exportCursor[format], format === 'csv' ? exportTableField.value : '', exportBatchSize.value);
     const url = URL.createObjectURL(data.blob);
     const link = document.createElement('a');
     link.href = url; link.download = `parsed-emails-${Date.now()}.${format}`;
@@ -268,7 +294,9 @@ async function download(format) {
   });
 }
 watch(activeTab, tab => { if (tab === 'results') loadJobs(); });
-watch([() => draft.value.rules, selectedSample, sampleInput], () => { preview.value = null; }, { deep: true });
+watch([() => draft.value.rules, selectedSample, sampleInput, sampleCsv], () => { preview.value = null; }, { deep: true });
+watch(exportTableField, value => { exportBatchSize.value = Math.min(exportBatchSize.value || 100, value ? 10 : 100); exportCursor.csv = '0_0'; exportMore.csv = false; });
+watch(exportTables, tables => { if (!tables.some(field => field.key === exportTableField.value)) exportTableField.value = ''; });
 onBeforeRouteLeave(confirmDiscard);
 onMounted(() => {
   reload();

@@ -24,11 +24,11 @@ app.post('/parser/configs', async c => c.json(result.ok(await parserService.save
 app.put('/parser/configs/:id', async c => c.json(result.ok(await parserService.saveConfig(c.env.db, owner(c), await requestBody(c), c.req.param('id')))));
 app.get('/parser/samples', async c => c.json(result.ok(await parserService.samples(c.env.db, owner(c), c.req.query('accountId')))));
 app.post('/parser/preview', async c => {
-    return c.json(result.ok(await parserService.preview(c.env.db, owner(c), await requestBody(c))));
+    return c.json(result.ok(await parserService.preview(c.env.db, owner(c), await requestBody(c), { env: c.env })));
 });
 app.post('/parser/enqueue', async c => {
     const { parserId, emailId } = await requestBody(c);
-    const job = await parserService.enqueue(c.env.db, owner(c), parserId, emailId);
+    const job = await parserService.enqueue(c.env.db, owner(c), parserId, emailId, { env: c.env });
     processLater(c);
     return c.json(result.ok(job));
 });
@@ -49,7 +49,10 @@ app.get('/parser/export', async c => {
         c.header('X-Next-Cursor', data.nextCursor);
         c.header('X-Has-More', String(data.hasMore));
         c.header('Cache-Control', 'no-store');
-        return c.body(csvExport(data.rows));
+        let csv;
+        try { csv = csvExport(data.rows, c.req.query('tableField')); }
+        catch (error) { throw new BizError(error.message, 400); }
+        return c.body(csv);
     }
     c.header('Cache-Control', 'no-store');
     return c.json(result.ok(data));

@@ -34,8 +34,9 @@ export default {
 	email: email,
 	async scheduled(c, env, ctx) {
 		if (c.cron === '* * * * *') {
-			await parserService.reconcile(env.db);
+			await parserService.reconcile(env.db, { env });
 			await parserService.process(env.db);
+			await parserService.cleanup(env.db);
 			return;
 		}
 		if (c.cron === '*/30 * * * *') {
