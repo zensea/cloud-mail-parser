@@ -1,0 +1,17 @@
+name = "cloud-mail-parser-tests"
+main = "src/index.js"
+compatibility_date = "2025-06-04"
+
+[[d1_databases]]
+binding = "db"
+database_name = "parser-tests"
+database_id = "00000000-0000-0000-0000-000000000001"
+
+[[kv_namespaces]]
+binding = "kv"
+id = "parser-tests"
+
+[vars]
+jwt_secret = "local-parser-tests-only"
+admin = "admin@example.test"
+domain = ["example.test"]

@@ -1,7 +1,7 @@
 <template>
   <div :class="accountShow && hasPerm('account:query') ? 'main-box-show' : 'main-box-hide'">
     <div :class="accountShow && hasPerm('account:query') ? 'block-show' : 'block-hide'" @click="uiStore.accountShow = false"></div>
-    <account  :class="accountShow && hasPerm('account:query') ? 'show' : 'hide'" />
+    <account v-show="route.meta.name !== 'parser'" :class="accountShow && hasPerm('account:query') ? 'show' : 'hide'" />
     <router-view class="main-view" v-slot="{ Component,route }">
       <keep-alive :include="['email','all-email','send','sys-setting','star','user','role','analysis','reg-key','draft']">
         <component :is="Component" :key="route.name"/>
@@ -25,7 +25,7 @@ let  innerWidth =  window.innerWidth
 let elNotification = null
 
 const accountShow = computed(() => {
-  return uiStore.accountShow && settingStore.settings.manyEmail === 0
+  return route.meta.name !== 'parser' && uiStore.accountShow && settingStore.settings.manyEmail === 0
 })
 
 watch(() => uiStore.changeNotice, () => {

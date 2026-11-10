@@ -1,0 +1,43 @@
+export const parserZh = {
+    title: '邮件解析', description: '从业务邮件提取字段，自动整理并发送结果。', configuration: '解析配置', results: '处理结果',
+    mailbox: '选择邮箱', name: '配置名称', enabled: '启用自动解析', enabledHelp: '自动处理配置建立后收到的邮件；历史邮件可手动提交。暂停后，待处理任务也会暂停。',
+    save: '保存配置', saved: '配置已保存', unsaved: '有尚未保存的修改', leave: '放弃未保存的修改？', confirm: '确认', cancel: '取消',
+    noAccounts: '请先创建一个邮箱，再配置邮件解析。', loadFailed: '加载失败，请重试。', refresh: '刷新', fields: '提取字段', addField: '添加字段',
+    fieldKey: '字段键名', source: '数据来源', required: '必填', remove: '移除', filters: '处理步骤', addFilter: '添加步骤', moveUp: '上移', moveDown: '下移',
+    start: '开始关键词', end: '结束关键词', pattern: '正则表达式（RE2）', group: '捕获组编号', flags: '匹配选项', search: '查找文字', replacement: '替换为', defaultValue: '默认值', dateFormat: '原始日期格式',
+    sources: { subject: '主题', text: '纯文本正文', htmlText: 'HTML 正文转文本', from: '发件人地址', to: '收件人地址' },
+    types: { between: '关键词截取', regex: '正则提取', replace: '文字替换', trim: '去除首尾空白', collapse: '整理空白', lower: '转为小写', upper: '转为大写', default: '设置默认值', number: '转为数字', date: '日期标准化' },
+    webhook: '结果推送', webhookHelp: '选填 HTTPS 接收地址。验证成功的结果会自动推送，失败后自动重试；接收端需按事件编号避免重复处理。',
+    webhookUrl: 'Webhook 地址', webhookSecret: '认证头内容', secretPlaceholder: '留空保留已有认证信息', secretSet: '已设置认证信息', clearSecret: '清除已有认证信息',
+    preview: '样本预览', sample: '历史邮件', custom: '手动输入样本', sampleHelp: '预览使用当前编辑中的规则，不会保存或发送结果。', subject: '样本主题', body: '样本正文', html: '样本 HTML（可选）', from: '样本发件人', to: '样本收件人',
+    runPreview: '预览提取结果', previewValid: '字段验证通过', previewInvalid: '部分字段需要调整', output: '提取结果', steps: '查看处理过程',
+    submit: '处理选中邮件', submitHelp: '先保存并启用配置，再提交历史邮件；同一邮件和规则版本只会建立一个任务。', submitted: '邮件已提交处理',
+    noJobs: '还没有解析任务。启用配置后等待新邮件，或提交一封历史邮件。', id: '任务', emailId: '邮件编号', version: '规则版本', state: '解析状态', delivery: '推送状态', detail: '详情',
+    states: { pending: '等待处理', processing: '处理中', parsed: '已解析', failed: '失败', none: '未配置', sending: '推送中', sent: '已送达' },
+    previous: '上一页', next: '下一页', exportCsv: '导出 CSV', exportJson: '导出 JSON', exportNext: '继续导出 {format}', exportHelp: '每批最多 100 条成功结果，可继续导出下一批。',
+    attempts: '尝试次数', error: '错误原因', retryParse: '重试解析', retryDispatch: '重试推送', retried: '已安排重试', deliveries: '推送记录', time: '时间', response: '响应状态',
+    sampleOrder: '订单号: A-100\n金额: 128.50\n客户: 示例客户', defaultName: '业务邮件解析', ruleHelp: '键名以英文字母开头，可包含数字和下划线；最多 30 个字段，每个字段最多 12 个步骤。',
+    emptyPreview: '选择历史邮件或输入样本，然后预览提取结果。', unavailable: '暂无', sourceStep: '原始数据', savedRules: '本次任务使用的规则', backToFirst: '回到第一页'
+};
+
+export const parserEn = {
+    title: 'Email parsing', description: 'Extract business data from emails and send structured results.', configuration: 'Configuration', results: 'Results',
+    mailbox: 'Mailbox', name: 'Configuration name', enabled: 'Enable automatic parsing', enabledHelp: 'Processes mail received after this configuration was created. Submit older mail manually. Pausing also pauses pending work.',
+    save: 'Save configuration', saved: 'Configuration saved', unsaved: 'Unsaved changes', leave: 'Discard unsaved changes?', confirm: 'Confirm', cancel: 'Cancel',
+    noAccounts: 'Create a mailbox before configuring email parsing.', loadFailed: 'Unable to load. Please retry.', refresh: 'Refresh', fields: 'Fields', addField: 'Add field',
+    fieldKey: 'Field key', source: 'Data source', required: 'Required', remove: 'Remove', filters: 'Processing steps', addFilter: 'Add step', moveUp: 'Move up', moveDown: 'Move down',
+    start: 'Start marker', end: 'End marker', pattern: 'Regular expression (RE2)', group: 'Capture group', flags: 'Matching flags', search: 'Find text', replacement: 'Replace with', defaultValue: 'Default value', dateFormat: 'Input date format',
+    sources: { subject: 'Subject', text: 'Plain text body', htmlText: 'HTML body as text', from: 'Sender address', to: 'Recipient address' },
+    types: { between: 'Between markers', regex: 'Regex extraction', replace: 'Replace text', trim: 'Trim whitespace', collapse: 'Normalize whitespace', lower: 'Lowercase', upper: 'Uppercase', default: 'Default value', number: 'Convert to number', date: 'Normalize date' },
+    webhook: 'Result delivery', webhookHelp: 'Optional HTTPS endpoint. Valid results are sent automatically with retries. The receiver should deduplicate by event ID.',
+    webhookUrl: 'Webhook URL', webhookSecret: 'Authorization header', secretPlaceholder: 'Leave blank to keep existing credentials', secretSet: 'Credentials configured', clearSecret: 'Clear existing credentials',
+    preview: 'Sample preview', sample: 'Received email', custom: 'Enter a sample', sampleHelp: 'Preview uses the current editor rules without saving or delivering results.', subject: 'Sample subject', body: 'Sample body', html: 'Sample HTML (optional)', from: 'Sample sender', to: 'Sample recipient',
+    runPreview: 'Preview extraction', previewValid: 'Fields passed validation', previewInvalid: 'Some fields need attention', output: 'Extracted data', steps: 'View processing steps',
+    submit: 'Process selected email', submitHelp: 'Save and enable the configuration first. Each email and rule version creates only one job.', submitted: 'Email queued',
+    noJobs: 'No parsing jobs yet. Enable the configuration and wait for mail, or submit a received email.', id: 'Job', emailId: 'Email ID', version: 'Rule version', state: 'Parsing', delivery: 'Delivery', detail: 'Details',
+    states: { pending: 'Pending', processing: 'Processing', parsed: 'Parsed', failed: 'Failed', none: 'Not configured', sending: 'Sending', sent: 'Delivered' },
+    previous: 'Previous', next: 'Next', exportCsv: 'Export CSV', exportJson: 'Export JSON', exportNext: 'Export next {format}', exportHelp: 'Exports up to 100 successful results per batch. Continue to download the next batch.',
+    attempts: 'Attempts', error: 'Error', retryParse: 'Retry parsing', retryDispatch: 'Retry delivery', retried: 'Retry scheduled', deliveries: 'Delivery history', time: 'Time', response: 'HTTP status',
+    sampleOrder: 'Order ID: A-100\nAmount: 128.50\nCustomer: Demo Customer', defaultName: 'Business email parser', ruleHelp: 'Keys start with a letter and contain letters, numbers or underscores. Up to 30 fields and 12 steps per field.',
+    emptyPreview: 'Select an email or enter a sample, then preview the extracted data.', unavailable: 'Not available', sourceStep: 'Source', savedRules: 'Rules used for this job', backToFirst: 'First page'
+};

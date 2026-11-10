@@ -75,6 +75,8 @@
 
 - **🔢 验证码识别**：使用Workers AI，自动识别邮件验证码 
 
+- **🧩 邮件解析**：按邮箱配置字段和处理规则，预览、自动提取、CSV/JSON 导出及可靠 Webhook 推送，详见[使用说明](doc/mailparser-usage.md)与[实施计划](doc/mailparser-implementation-plan.md)
+
 - **📈 数据可视化**：使用ECharts对系统数据详情，用户邮件增长可视化显示
 
 - **🎨 个性化设置**：可以自定义网站标题，登录背景，透明度

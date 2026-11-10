@@ -6,6 +6,7 @@ import emailService from './service/email-service';
 import r2Service from './service/r2-service';
 import oauthService from './service/oauth-service';
 import analysisService from './service/analysis-service';
+import parserService from './service/parser-service';
 export default {
 	 async fetch(req, env, ctx) {
 
@@ -32,6 +33,11 @@ export default {
 	},
 	email: email,
 	async scheduled(c, env, ctx) {
+		if (c.cron === '* * * * *') {
+			await parserService.reconcile(env.db);
+			await parserService.process(env.db);
+			return;
+		}
 		if (c.cron === '*/30 * * * *') {
 			await analysisService.refreshEchartsCache({ env })
 			return;

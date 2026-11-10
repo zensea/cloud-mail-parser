@@ -4,7 +4,8 @@
 	"private": true,
 	"scripts": {
 		"dev": "wrangler dev --config wrangler-dev.toml",
-		"test": "wrangler deploy --config wrangler-test.toml",
+		"test": "vitest run",
+		"deploy:test": "wrangler deploy --config wrangler-test.toml",
 		"deploy": "wrangler deploy",
 		"start": "wrangler dev"
 	},
@@ -22,6 +23,7 @@
 		"i18next": "^25.3.2",
 		"linkedom": "^0.18.10",
 		"postal-mime": "^2.4.3",
+		"re2js": "2.9.1",
 		"resend": "^6.4.1",
 		"ua-parser-js": "^2.0.3",
 		"uuid": "^11.1.0"

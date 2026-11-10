@@ -12,6 +12,12 @@ const routes = [
         component: () => import('@/layout/index.vue'),
         children: [
             {
+                path: '/parser',
+                name: 'parser',
+                component: () => import('@/views/parser/index.vue'),
+                meta: { title: 'parser.title', name: 'parser', menu: true }
+            },
+            {
                 path: '/inbox',
                 name: 'email',
                 component: () => import('@/views/email/index.vue'),

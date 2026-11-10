@@ -30,6 +30,11 @@
           <Icon icon="solar:star-line-duotone" width="20" height="20" />
           <span class="menu-name" style="margin-left: 16px">{{$t('starred')}}</span>
         </el-menu-item>
+        <el-menu-item @click="router.push({name: 'parser'})" index="parser"
+                      :class="route.meta.name === 'parser' ? 'choose-item' : ''">
+          <Icon icon="ep:filter" width="20" height="20" />
+          <span class="menu-name" style="margin-left: 16px">{{$t('parser.title')}}</span>
+        </el-menu-item>
         <el-menu-item @click="router.push({name: 'setting'})" index="setting"
                       :class="route.meta.name === 'setting' ? 'choose-item' : ''">
           <Icon icon="fluent:settings-48-regular" width="20" height="20" />
