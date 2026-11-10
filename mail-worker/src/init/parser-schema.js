@@ -7,7 +7,7 @@ export const parserSchema = [
         name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0, version INTEGER NOT NULL DEFAULT 1,
         rules_json TEXT NOT NULL, webhook_url TEXT NOT NULL DEFAULT '', webhook_secret TEXT NOT NULL DEFAULT '',
         start_email_id INTEGER NOT NULL DEFAULT 0, last_scanned_at INTEGER NOT NULL DEFAULT 0,
-        retention_days INTEGER NOT NULL DEFAULT 0,
+        retention_days INTEGER NOT NULL DEFAULT 0, conditions_json TEXT NOT NULL DEFAULT '[]', scan_email_id INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(user_id, account_id)
     )`,
     `CREATE INDEX IF NOT EXISTS idx_parser_config_scan ON parser_config(enabled, last_scanned_at)`,
@@ -40,7 +40,8 @@ export const parserSchema = [
 export async function initParserSchema(db) {
     await db.batch(parserSchema.map(sql => db.prepare(sql)));
     const { results } = await db.prepare('PRAGMA table_info(parser_config)').all();
-    if (!results.some(column => column.name === 'retention_days')) {
-        await db.prepare('ALTER TABLE parser_config ADD COLUMN retention_days INTEGER NOT NULL DEFAULT 0').run();
+    const additions = { retention_days: 'INTEGER NOT NULL DEFAULT 0', conditions_json: "TEXT NOT NULL DEFAULT '[]'", scan_email_id: 'INTEGER NOT NULL DEFAULT 0' };
+    for (const [name, definition] of Object.entries(additions)) {
+        if (!results.some(column => column.name === name)) await db.prepare(`ALTER TABLE parser_config ADD COLUMN ${name} ${definition}`).run();
     }
 }

@@ -29,7 +29,7 @@ app.post('/parser/preview', async c => {
 app.post('/parser/enqueue', async c => {
     const { parserId, emailId } = await requestBody(c);
     const job = await parserService.enqueue(c.env.db, owner(c), parserId, emailId, { env: c.env });
-    processLater(c);
+    if (job.id) processLater(c);
     return c.json(result.ok(job));
 });
 app.get('/parser/jobs', async c => c.json(result.ok(await parserService.jobs(c.env.db, owner(c), c.req.query()))));

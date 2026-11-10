@@ -1,11 +1,13 @@
 import BizError from '../error/biz-error';
 import { validateRules, parseEmail, emailInput, checkSize } from '../lib/parser-engine';
 import { readEmailInput } from './parser-input';
+import { validateConditions, matchEmail } from '../lib/parser-matcher';
+import { emailConst } from '../const/entity-const';
 
 const LEASE_MS = 60000;
 const MAX_PARSE_ATTEMPTS = 3;
 const MAX_DISPATCH_ATTEMPTS = 5;
-const configFields = 'id, user_id, account_id, name, enabled, version, rules_json, webhook_url, webhook_secret, start_email_id, retention_days, created_at, updated_at';
+const configFields = 'id, user_id, account_id, name, enabled, version, rules_json, webhook_url, webhook_secret, start_email_id, retention_days, conditions_json, scan_email_id, created_at, updated_at';
 
 export function positiveId(value) {
     const id = Number(value);
@@ -29,7 +31,7 @@ export function validateWebhook(value) {
 
 function configView(row) {
     return { id: row.id, accountId: row.account_id, name: row.name, enabled: !!row.enabled, version: row.version,
-        rules: JSON.parse(row.rules_json), webhookUrl: row.webhook_url, hasWebhookSecret: !!row.webhook_secret,
+        rules: JSON.parse(row.rules_json), conditions: JSON.parse(row.conditions_json), webhookUrl: row.webhook_url, hasWebhookSecret: !!row.webhook_secret,
         retentionDays: row.retention_days, createdAt: row.created_at, updatedAt: row.updated_at };
 }
 
@@ -65,19 +67,24 @@ async function addJob(db, config, email, options) {
     const emailId = email.email_id ?? email.emailId;
     const existing = await db.prepare('SELECT * FROM parser_job WHERE parser_id=? AND email_id=? AND version=?')
         .bind(config.id, emailId, config.version).first();
-    if (existing) return existing;
+    if (existing) return { job: existing };
     const now = Date.now();
     let input = 'null';
     let error = '';
-    try { input = JSON.stringify(await readEmailInput(db, email, JSON.parse(config.rules_json), options)); }
+    try {
+        const match = matchEmail(JSON.parse(config.conditions_json), email);
+        if (!match.matched) return { job: null, match };
+        input = JSON.stringify(await readEmailInput(db, email, JSON.parse(config.rules_json), options));
+    }
     catch (reason) { if (reason.code === 503) throw reason; error = reason.message; }
     await db.prepare(`INSERT OR IGNORE INTO parser_job
         (parser_id,user_id,account_id,email_id,version,rules_json,input_json,status,error,available_at,webhook_url,webhook_secret,created_at,updated_at)
         SELECT id,user_id,account_id,?,version,rules_json,?,?,?, ?,webhook_url,webhook_secret,?,? FROM parser_config
         WHERE id = ? AND user_id = ? AND version = ? AND enabled = 1`)
         .bind(emailId, input, error ? 'failed' : 'pending', error, now, now, now, config.id, config.user_id, config.version).run();
-    return db.prepare('SELECT * FROM parser_job WHERE parser_id = ? AND email_id = ? AND version = ?')
+    const job = await db.prepare('SELECT * FROM parser_job WHERE parser_id = ? AND email_id = ? AND version = ?')
         .bind(config.id, emailId, config.version).first();
+    return { job };
 }
 
 const parserService = {
@@ -100,7 +107,11 @@ const parserService = {
         if (params.retentionDays !== undefined && (!Number.isInteger(params.retentionDays) || params.retentionDays < 0 || params.retentionDays > 60)) throw new BizError('Retention must be 0 to 60 days; 0 disables cleanup', 400);
         if (params.clearWebhookSecret !== undefined && typeof params.clearWebhookSecret !== 'boolean') throw new BizError('Clear credential must be a boolean', 400);
         let rules;
-        try { rules = validateRules(params.rules); } catch (error) { throw new BizError(error.message, 400); }
+        let conditions;
+        try {
+            rules = validateRules(params.rules);
+            if (params.conditions !== undefined) conditions = validateConditions(params.conditions);
+        } catch (error) { throw new BizError(error.message, 400); }
         const url = validateWebhook(params.webhookUrl);
         if (params.webhookSecret !== undefined && (typeof params.webhookSecret !== 'string' || params.webhookSecret.length > 1024 || /[\r\n]/.test(params.webhookSecret))) {
             throw new BizError('Invalid webhook credential', 400);
@@ -111,16 +122,16 @@ const parserService = {
             if (old.account_id !== accountId) throw new BizError('The mailbox of an existing parser cannot be changed', 400);
             if (params.version !== old.version) throw new BizError('Configuration changed. Reload before saving.', 409);
             const secret = params.clearWebhookSecret ? '' : params.webhookSecret || old.webhook_secret;
-            const row = await db.prepare(`UPDATE parser_config SET name=?,enabled=?,version=version+1,rules_json=?,webhook_url=?,webhook_secret=?,retention_days=?,updated_at=?
+            const row = await db.prepare(`UPDATE parser_config SET name=?,enabled=?,version=version+1,rules_json=?,webhook_url=?,webhook_secret=?,retention_days=?,conditions_json=?,updated_at=?
                 WHERE id=? AND user_id=? AND version=? RETURNING *`)
-                .bind(params.name.trim(), Number(params.enabled), JSON.stringify(rules), url, secret, params.retentionDays ?? old.retention_days, now, old.id, userId, old.version).first();
+                .bind(params.name.trim(), Number(params.enabled), JSON.stringify(rules), url, secret, params.retentionDays ?? old.retention_days, conditions === undefined ? old.conditions_json : JSON.stringify(conditions), now, old.id, userId, old.version).first();
             if (!row) throw new BizError('Configuration changed. Reload before saving.', 409);
             return configView(row);
         }
-        const row = await db.prepare(`INSERT INTO parser_config (user_id,account_id,name,enabled,rules_json,webhook_url,webhook_secret,retention_days,start_email_id,created_at,updated_at)
-            SELECT ?,?,?,?,?,?,?,?,COALESCE(MAX(email_id),0),?,? FROM email WHERE account_id = ?
+        const row = await db.prepare(`INSERT INTO parser_config (user_id,account_id,name,enabled,rules_json,webhook_url,webhook_secret,retention_days,conditions_json,start_email_id,created_at,updated_at)
+            SELECT ?,?,?,?,?,?,?,?,?,COALESCE(MAX(email_id),0),?,? FROM email WHERE account_id = ?
             ON CONFLICT(user_id,account_id) DO NOTHING RETURNING *`)
-            .bind(userId, accountId, params.name.trim(), Number(params.enabled), JSON.stringify(rules), url, params.webhookSecret || '', params.retentionDays ?? 0, now, now, accountId).first();
+            .bind(userId, accountId, params.name.trim(), Number(params.enabled), JSON.stringify(rules), url, params.webhookSecret || '', params.retentionDays ?? 0, JSON.stringify(conditions ?? []), now, now, accountId).first();
         if (!row) throw new BizError('This mailbox already has a parser', 409);
         return configView(row);
     },
@@ -139,8 +150,11 @@ const parserService = {
         await ownAccount(db, params.accountId, userId);
         const row = params.emailId ? await ownEmail(db, params.emailId, userId, Number(params.accountId)) : null;
         try {
-            const input = row ? await readEmailInput(db, row, params.rules, options) : emailInput(params.sample || {});
-            return parseEmail(params.rules, input, true);
+            const rules = validateRules(params.rules);
+            const match = matchEmail(params.conditions, row || params.sample || {}, true);
+            if (!match.matched) return { match, data: {}, errors: [], fields: [] };
+            const input = row ? await readEmailInput(db, row, rules, options) : emailInput(params.sample || {});
+            return { ...parseEmail(rules, input, true), match };
         } catch (error) { throw new BizError(error.message, error.code === 503 ? 503 : 400); }
     },
 
@@ -148,7 +162,8 @@ const parserService = {
         const config = await ownConfig(db, parserId, userId);
         await ownAccount(db, config.account_id, userId);
         if (!config.enabled) throw new BizError('Enable this parser before processing emails', 409);
-        const row = await addJob(db, config, await ownEmail(db, emailId, userId, config.account_id), options);
+        const { job: row, match } = await addJob(db, config, await ownEmail(db, emailId, userId, config.account_id), options);
+        if (match && !match.matched) return { matched: false, checks: match.checks };
         if (!row) throw new BizError('Configuration changed. Reload before processing.', 409);
         if (row.status === 'expired') throw new BizError('This result has expired; save a new rule version before resubmitting', 410);
         return jobView(row);
@@ -157,7 +172,7 @@ const parserService = {
     async receive(db, email, options) {
         if (!email.userId || !email.accountId) return;
         const config = await db.prepare('SELECT * FROM parser_config WHERE user_id=? AND account_id=? AND enabled=1').bind(email.userId, email.accountId).first();
-        return config ? !!(await addJob(db, config, email, options)) : false;
+        return config ? !!(await addJob(db, config, email, options)).job : false;
     },
 
     async reconcile(db, options) {
@@ -165,12 +180,27 @@ const parserService = {
             JOIN user u ON u.user_id=c.user_id AND u.status=0 AND u.is_del=0
             WHERE c.enabled=1 ORDER BY c.last_scanned_at,c.id LIMIT 10`).all();
         for (const config of configs) {
-            const { results: emails } = await db.prepare(`SELECT e.* FROM email e WHERE e.user_id=? AND e.account_id=? AND e.email_id>?
-                AND e.type=0 AND e.status=0 AND e.is_del=0 AND NOT EXISTS (SELECT 1 FROM parser_job j WHERE j.parser_id=? AND j.email_id=e.email_id)
-                ORDER BY e.email_id LIMIT 10`).bind(config.user_id, config.account_id, config.start_email_id, config.id).all();
+            const { results: emails } = await db.prepare(`SELECT e.* FROM email e WHERE e.user_id=? AND e.account_id=? AND e.email_id>? AND e.email_id>?
+                AND e.type=0 ORDER BY e.email_id LIMIT 10`).bind(config.user_id, config.account_id, config.start_email_id, config.scan_email_id).all();
             for (const email of emails) {
-                try { await addJob(db, config, email, options); }
-                catch (error) { if (error.code !== 503) throw error; console.error('Parser CSV storage unavailable; reconciliation will retry'); }
+                // A MIME receipt may complete out of order. Never scan past an unfinished receipt.
+                if (email.status === emailConst.status.SAVING) break;
+                if (email.status === emailConst.status.RECEIVE && email.is_del === 0) {
+                    const existing = await db.prepare('SELECT id FROM parser_job WHERE parser_id=? AND email_id=? LIMIT 1').bind(config.id, email.email_id).first();
+                    if (!existing) {
+                        try {
+                            const result = await addJob(db, config, email, options);
+                            if (!result.job && !result.match) break; // Configuration changed while registering.
+                        } catch (error) {
+                            if (error.code !== 503) throw error;
+                            console.error('Parser CSV storage unavailable; reconciliation will retry');
+                            break;
+                        }
+                    }
+                }
+                const advanced = await db.prepare('UPDATE parser_config SET scan_email_id=MAX(scan_email_id,?) WHERE id=? AND version=? AND enabled=1')
+                    .bind(email.email_id, config.id, config.version).run();
+                if (!advanced.meta.changes) break;
             }
             await db.prepare('UPDATE parser_config SET last_scanned_at=? WHERE id=?').bind(Date.now(), config.id).run();
         }

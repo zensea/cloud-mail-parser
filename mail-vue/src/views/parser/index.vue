@@ -32,6 +32,7 @@
                   <p class="help">{{ t('parser.retentionHelp') }}</p>
                 </el-form-item>
               </el-form>
+              <condition-editor v-model="draft.conditions" />
               <rule-editor v-model="draft.rules" :attachment-names="attachmentNames" />
               <section class="delivery-settings" aria-labelledby="parser-webhook-heading">
                 <h3 id="parser-webhook-heading">{{ t('parser.webhook') }}</h3>
@@ -63,6 +64,8 @@
                 </el-form-item>
                 <template v-if="!selectedSample">
                   <el-form-item :label="t('parser.subject')" for="parser-sample-subject"><el-input id="parser-sample-subject" v-model="sampleInput.subject" /></el-form-item>
+                  <el-form-item :label="t('parser.from')" for="parser-sample-from"><el-input id="parser-sample-from" v-model="sampleInput.from" /></el-form-item>
+                  <el-form-item :label="t('parser.to')" for="parser-sample-to"><el-input id="parser-sample-to" v-model="sampleInput.to" /></el-form-item>
                   <el-form-item :label="t('parser.body')" for="parser-sample-body"><el-input id="parser-sample-body" v-model="sampleInput.text" type="textarea" :rows="7" /></el-form-item>
                   <template v-if="hasCsvRule">
                     <el-form-item :label="t('parser.sampleCsvName')" for="parser-csv-name"><el-input id="parser-csv-name" v-model="sampleCsv.name" maxlength="255" /></el-form-item>
@@ -71,8 +74,6 @@
                   <el-collapse>
                     <el-collapse-item :title="t('parser.html')" name="sample-extra">
                       <el-input v-model="sampleInput.html" :aria-label="t('parser.html')" type="textarea" :rows="4" />
-                      <el-input v-model="sampleInput.from" :aria-label="t('parser.from')" :placeholder="t('parser.from')" class="extra-input" />
-                      <el-input v-model="sampleInput.to" :aria-label="t('parser.to')" :placeholder="t('parser.to')" class="extra-input" />
                     </el-collapse-item>
                   </el-collapse>
                 </template>
@@ -80,10 +81,17 @@
               </el-form>
               <div class="preview-actions">
                 <el-button type="primary" plain :loading="busy.previewing" @click="runPreview">{{ t('parser.runPreview') }}</el-button>
-                <el-button :loading="busy.submitting" :disabled="!selectedSample || !draft.id || !draft.enabled || dirty" @click="submit">{{ t('parser.submit') }}</el-button>
+                <el-button :loading="busy.submitting" :disabled="!selectedSample || !draft.id || !draft.enabled || dirty || preview?.match?.matched === false" @click="submit">{{ t('parser.submit') }}</el-button>
               </div>
               <p class="help">{{ t('parser.submitHelp') }}</p>
               <template v-if="preview">
+                <template v-if="preview.match && draft.conditions.length">
+                  <el-alert :title="t(preview.match.matched ? 'parser.matchPassed' : 'parser.matchSkipped')" :type="preview.match.matched ? 'success' : 'info'" :closable="false" show-icon />
+                  <ul class="match-checks"><li v-for="check in preview.match.checks" :key="check.index">
+                    {{ check.matched ? '✓' : '✕' }} {{ t(`parser.sources.${check.source}`) }} · {{ t(`parser.matchOperators.${check.operator}`) }}: {{ draft.conditions[check.index]?.value }}
+                  </li></ul>
+                </template>
+                <template v-if="preview.match?.matched !== false">
                 <el-alert :title="t(preview.errors.length ? 'parser.previewInvalid' : 'parser.previewValid')" :type="preview.errors.length ? 'warning' : 'success'" :closable="false" show-icon />
                 <table-results :data="preview.data" />
                 <h4>{{ t('parser.output') }}</h4>
@@ -97,6 +105,7 @@
                     </div>
                   </el-collapse-item>
                 </el-collapse>
+                </template>
               </template>
               <el-empty v-else :description="t('parser.emptyPreview')" :image-size="70" />
             </section>
@@ -172,12 +181,13 @@ import { useI18n } from 'vue-i18n';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { useAccountStore } from '@/store/account.js';
 import RuleEditor from './rule-editor.vue';
+import ConditionEditor from './condition-editor.vue';
 import TableResults from './table-results.vue';
 import { parserAccounts, parserConfigs, parserSave, parserSamples, parserPreview, parserEnqueue, parserJobs, parserJob, parserRetry, parserDownload } from '@/request/parser.js';
 
 const { t } = useI18n();
 const accounts = ref([]), configs = ref([]), selectedAccount = ref(0), selectedSample = ref(0), samples = ref([]);
-const activeTab = ref('configuration'), draft = ref({ rules: [] }), baseline = ref(''), preview = ref(null), error = ref('');
+const activeTab = ref('configuration'), draft = ref({ rules: [], conditions: [] }), baseline = ref(''), preview = ref(null), error = ref('');
 const busy = reactive({ loading: false, saving: false, previewing: false, submitting: false, jobs: false, exporting: false, retrying: false });
 const jobs = ref([]), cursor = ref(0), nextCursor = ref(0), cursorStack = ref([]), hasMore = ref(false);
 const drawerOpen = ref(false), detail = ref(null);
@@ -211,7 +221,7 @@ async function selectAccount(accountId) {
   selectedAccount.value = accountId;
   const saved = configs.value.find(config => config.accountId === accountId);
   draft.value = saved ? { ...JSON.parse(JSON.stringify(saved)), webhookSecret: '', clearWebhookSecret: false } : {
-    accountId, name: t('parser.defaultName'), enabled: false, retentionDays: 30, webhookUrl: '', webhookSecret: '', clearWebhookSecret: false,
+    accountId, name: t('parser.defaultName'), enabled: false, retentionDays: 30, conditions: [], webhookUrl: '', webhookSecret: '', clearWebhookSecret: false,
     rules: [{ key: 'order_id', source: 'text', required: true, filters: [{ type: 'regex', pattern: '(?:订单号|Order ID): ([A-Z0-9-]+)', flags: 'm', group: 1 }] }]
   };
   baseline.value = JSON.stringify(draft.value);
@@ -250,12 +260,13 @@ async function runPreview() {
   });
 }
 function previewPayload() {
-  return { accountId: selectedAccount.value, rules: draft.value.rules,
+  return { accountId: selectedAccount.value, rules: draft.value.rules, conditions: draft.value.conditions,
     ...(selectedSample.value ? { emailId: selectedSample.value } : { sample: { ...sampleInput, attachments: hasCsvRule.value ? [sampleCsv] : [] } }) };
 }
 async function submit() {
   await run('submitting', async () => {
-    await parserEnqueue(draft.value.id, selectedSample.value);
+    const result = await parserEnqueue(draft.value.id, selectedSample.value);
+    if (result.matched === false) { ElMessage.info(t('parser.notSubmitted')); return; }
     cursor.value = 0; cursorStack.value = [];
     activeTab.value = 'results';
     await loadJobs();
@@ -294,7 +305,7 @@ async function download(format) {
   });
 }
 watch(activeTab, tab => { if (tab === 'results') loadJobs(); });
-watch([() => draft.value.rules, selectedSample, sampleInput, sampleCsv], () => { preview.value = null; }, { deep: true });
+watch([() => draft.value.rules, () => draft.value.conditions, selectedSample, sampleInput, sampleCsv], () => { preview.value = null; }, { deep: true });
 watch(exportTableField, value => { exportBatchSize.value = Math.min(exportBatchSize.value || 100, value ? 10 : 100); exportCursor.csv = '0_0'; exportMore.csv = false; });
 watch(exportTables, tables => { if (!tables.some(field => field.key === exportTableField.value)) exportTableField.value = ''; });
 onBeforeRouteLeave(confirmDiscard);
@@ -330,6 +341,7 @@ h4 { font-size: 14px; font-weight: 600; margin: 20px 0 10px; }
 .extra-input { margin-top: 10px; }
 .json-output, .trace-field pre { padding: 12px; border-radius: 6px; background: var(--el-fill-color-light); white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.6 ui-monospace, Consolas, monospace; max-height: 350px; overflow: auto; }
 .field-errors { color: var(--el-color-danger); font-size: 13px; margin: 12px 0; overflow-wrap: anywhere; }
+.match-checks { font-size: 13px; margin: 12px 0; overflow-wrap: anywhere; }
 .trace-field { margin: 14px 0; }
 .trace-field li { margin-top: 10px; }
 .trace-field span { color: var(--el-text-color-secondary); font-size: 12px; }

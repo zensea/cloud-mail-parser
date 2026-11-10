@@ -425,6 +425,128 @@ describe('retention migration and terminal job cleanup', () => {
     });
 });
 
+const matchCondition = (source, value, operator = 'equals') => ({ source, value, operator });
+
+describe('matching conditions across preview, receipt and durable recovery', () => {
+    it('upgrades previous schemas with no restrictions and preserves existing configuration', async () => {
+        const config = await parserService.saveConfig(env.db, 1, configuration());
+        await env.db.prepare('ALTER TABLE parser_config DROP COLUMN conditions_json').run();
+        await env.db.prepare('ALTER TABLE parser_config DROP COLUMN scan_email_id').run();
+        await initParserSchema(env.db); await initParserSchema(env.db);
+        const updated = (await parserService.configs(env.db, 1))[0];
+        expect(updated).toMatchObject({ id: config.id, version: 1, conditions: [], retentionDays: 0 });
+        expect(updated.rules).toEqual(config.rules);
+        expect((await parserService.enqueue(env.db, 1, config.id, 1)).status).toBe('pending');
+    });
+    it('normalizes and versions conditions, preserves them for older clients and rejects invalid saves', async () => {
+        const conditions = [matchCondition('subject', '订单', 'contains')];
+        const config = await parserService.saveConfig(env.db, 1, configuration({ conditions }));
+        expect(config.conditions).toEqual([{ ...conditions[0], caseSensitive: false }]);
+        const updated = await parserService.saveConfig(env.db, 1, configuration({ version: 1 }), config.id);
+        expect(updated.conditions).toEqual(config.conditions); expect(updated.version).toBe(2);
+        const invalid = await api(`/parser/configs/${config.id}`, { method: 'PUT', body: configuration({ version: 2, conditions: [matchCondition('subject', '(?<=a)b', 'regex')] }) });
+        expect(invalid.code).toBe(400);
+        expect((await parserService.configs(env.db, 1))[0].version).toBe(2);
+        const cleared = await parserService.saveConfig(env.db, 1, configuration({ version: 2, conditions: [] }), config.id);
+        expect(cleared.conditions).toEqual([]);
+    });
+    it('reports each preview condition and skips extraction without an error or job when unmatched', async () => {
+        const conditions = [matchCondition('from', 'shop@example.test'), matchCondition('subject', 'INVOICE', 'contains')];
+        const preview = await api('/parser/preview', { method: 'POST', body: { accountId: 1, emailId: 1, rules, conditions } });
+        expect(preview.code).toBe(200);
+        expect(preview.data.match).toMatchObject({ matched: false, checks: [{ matched: true }, { matched: false }] });
+        expect(preview.data.data).toEqual({}); expect(preview.data.fields).toEqual([]);
+        expect((await env.db.prepare('SELECT COUNT(*) AS total FROM parser_job').first()).total).toBe(0);
+        const accepted = await api('/parser/preview', { method: 'POST', body: { accountId: 1, emailId: 1, rules, conditions: [conditions[0]] } });
+        expect(accepted.data.match.matched).toBe(true); expect(accepted.data.data.order_id).toBe('A-100');
+    });
+    it('enforces saved conditions for manual submission and leaves mail untouched', async () => {
+        const config = await parserService.saveConfig(env.db, 1, configuration({ conditions: [matchCondition('subject', 'INVOICE', 'contains')] }));
+        const rejected = await api('/parser/enqueue', { method: 'POST', body: { parserId: config.id, emailId: 1, conditions: [] } });
+        expect(rejected.code).toBe(200); expect(rejected.data.matched).toBe(false); expect(rejected.data.id).toBeUndefined();
+        expect((await parserService.jobs(env.db, 1, { parserId: config.id })).rows).toEqual([]);
+        expect((await env.db.prepare('SELECT subject,is_del FROM email WHERE email_id=1').first())).toMatchObject({ subject: '订单 A', is_del: 0 });
+        expect((await api('/parser/enqueue', { method: 'POST', userId: 2, body: { parserId: config.id, emailId: 1 } })).code).toBe(404);
+    });
+    it('does not access missing CSV storage for non-matching mail', async () => {
+        const key = await csvFile(); await env.kv.delete(key);
+        const conditions = [matchCondition('subject', 'INVOICE', 'contains')];
+        const config = await parserService.saveConfig(env.db, 1, configuration({ rules: csvRules, conditions }));
+        const preview = await parserService.preview(env.db, 1, { accountId: 1, emailId: 1, rules: csvRules, conditions }, { env });
+        expect(preview.match.matched).toBe(false);
+        expect((await parserService.enqueue(env.db, 1, config.id, 1, { env })).matched).toBe(false);
+        expect((await parserService.jobs(env.db, 1, { parserId: config.id })).rows).toEqual([]);
+    });
+    it('scans past more than one batch of non-matching mail without creating skipped jobs or blocking later matches', async () => {
+        const config = await parserService.saveConfig(env.db, 1, configuration({ conditions: [matchCondition('subject', '订单', 'contains')] }));
+        await env.db.batch(Array.from({ length: 25 }, () => env.db.prepare("INSERT INTO email(user_id,account_id,subject,text) VALUES(1,1,'Newsletter','ignored')")));
+        const accepted = await env.db.prepare("INSERT INTO email(user_id,account_id,subject,text) VALUES(1,1,'新订单','订单号: LAST-1') RETURNING email_id").first();
+        for (let index = 0; index < 4; index++) await worker.scheduled({ cron: '* * * * *' }, env, createExecutionContext());
+        const jobs = await parserService.jobs(env.db, 1, { parserId: config.id });
+        expect(jobs.rows).toHaveLength(1); expect(jobs.rows[0].data.order_id).toBe('LAST-1');
+        expect((await env.db.prepare('SELECT scan_email_id FROM parser_config WHERE id=?').bind(config.id).first()).scan_email_id).toBe(accepted.email_id);
+        expect((await env.db.prepare('SELECT COUNT(*) AS total FROM email').first()).total).toBe(29);
+    });
+    it('does not advance past a receipt still saving, including its temporary deleted flag', async () => {
+        const config = await parserService.saveConfig(env.db, 1, configuration({ conditions: [matchCondition('subject', '订单', 'contains')] }));
+        const saving = await env.db.prepare("INSERT INTO email(user_id,account_id,subject,text,status,is_del) VALUES(1,1,'新订单','订单号: EARLY-1',6,1) RETURNING email_id").first();
+        await env.db.prepare("INSERT INTO email(user_id,account_id,subject,text) VALUES(1,1,'新订单','订单号: LATER-1')").run();
+        await parserService.reconcile(env.db);
+        expect((await parserService.jobs(env.db, 1, { parserId: config.id })).rows).toEqual([]);
+        await env.db.prepare('UPDATE email SET status=0,is_del=0 WHERE email_id=?').bind(saving.email_id).run();
+        await worker.scheduled({ cron: '* * * * *' }, env, createExecutionContext());
+        expect((await parserService.jobs(env.db, 1, { parserId: config.id })).rows.map(row => row.data.order_id).sort()).toEqual(['EARLY-1', 'LATER-1']);
+    });
+    it('keeps transient attachment failures before the scan cursor eligible for recovery', async () => {
+        const config = await parserService.saveConfig(env.db, 1, configuration({ rules: csvRules, conditions: [matchCondition('subject', 'ACCEPT')] }));
+        const first = await env.db.prepare("INSERT INTO email(user_id,account_id,subject) VALUES(1,1,'ACCEPT') RETURNING email_id").first();
+        const key = await csvFile({ emailId: first.email_id }); await env.kv.delete(key);
+        const later = await env.db.prepare("INSERT INTO email(user_id,account_id,subject) VALUES(1,1,'ACCEPT') RETURNING email_id").first();
+        await csvFile({ emailId: later.email_id });
+        await parserService.reconcile(env.db, { env });
+        expect((await parserService.jobs(env.db, 1, { parserId: config.id })).rows).toEqual([]);
+        await env.kv.put(key, 'item,qty\nRestored,1');
+        await worker.scheduled({ cron: '* * * * *' }, env, createExecutionContext());
+        const jobs = (await parserService.jobs(env.db, 1, { parserId: config.id })).rows;
+        expect(jobs).toHaveLength(2); expect(jobs.every(job => job.status === 'parsed')).toBe(true);
+    });
+    it('does not replay previously skipped mail after condition changes; explicit submission uses the new version', async () => {
+        const config = await parserService.saveConfig(env.db, 1, configuration({ conditions: [matchCondition('subject', 'INVOICE')] }));
+        const email = await env.db.prepare("INSERT INTO email(user_id,account_id,subject,text) VALUES(1,1,'ORDER','订单号: SKIP-1') RETURNING email_id").first();
+        await parserService.reconcile(env.db);
+        await parserService.saveConfig(env.db, 1, configuration({ version: 1, conditions: [] }), config.id);
+        await parserService.reconcile(env.db);
+        expect((await parserService.jobs(env.db, 1, { parserId: config.id })).rows).toEqual([]);
+        const submitted = await api('/parser/enqueue', { method: 'POST', body: { parserId: config.id, emailId: email.email_id } });
+        expect(submitted.data.version).toBe(2);
+        expect((await parserService.job(env.db, 1, submitted.data.id)).data.order_id).toBe('SKIP-1');
+    });
+    it('preserves already registered job snapshots when conditions are edited', async () => {
+        const config = await parserService.saveConfig(env.db, 1, configuration());
+        const job = await parserService.enqueue(env.db, 1, config.id, 1);
+        await parserService.saveConfig(env.db, 1, configuration({ version: 1, conditions: [matchCondition('subject', 'NO MATCH')] }), config.id);
+        await parserService.process(env.db);
+        expect((await parserService.job(env.db, 1, job.id)).data.order_id).toBe('A-100');
+        expect((await parserService.enqueue(env.db, 1, config.id, 1)).matched).toBe(false);
+    });
+    it('filters through the real MIME handler using the From header and delivered mailbox', async () => {
+        const conditions = [matchCondition('from', 'shop@example.test'), matchCondition('to', 'orders@example.test'), matchCondition('subject', 'ORDER', 'contains')];
+        const config = await parserService.saveConfig(env.db, 1, configuration({ conditions }));
+        await env.kv.put('setting:', JSON.stringify({ receive: 0, emailPrefixFilter: '', noRecipient: 1, aiCode: 1, tgBotStatus: 1, forwardStatus: 1, webhookStatus: 1 }));
+        const reject = vi.fn();
+        for (const subject of ['Newsletter', 'New ORDER']) {
+            const raw = `From: Shop <shop@example.test>\r\nTo: original@example.test\r\nSubject: ${subject}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n订单号: MIME-1`;
+            const ctx = createExecutionContext();
+            await receiveEmail({ from: 'bounce@example.test', to: 'orders@example.test', raw: new Response(raw).body, setReject: reject }, env, ctx);
+            await waitOnExecutionContext(ctx);
+        }
+        expect(reject).not.toHaveBeenCalled();
+        const jobs = (await parserService.jobs(env.db, 1, { parserId: config.id })).rows;
+        expect(jobs).toHaveLength(1); expect(jobs[0].data.order_id).toBe('MIME-1');
+        expect((await env.db.prepare('SELECT COUNT(*) AS total FROM email').first()).total).toBe(5);
+    });
+});
+
 describe('webhook target validation', () => {
     it.each(['http://example.com', 'https://127.0.0.1', 'https://[::1]', 'https://localhost', 'https://foo.internal', 'https://example.com:8443', 'https://user:pass@example.com'])('rejects unsafe destination %s', url => {
         expect(() => validateWebhook(url)).toThrow();
