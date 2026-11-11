@@ -71,7 +71,7 @@ With only one domain, you can create multiple different email addresses, similar
 
 - **🔢 Verification Code Recognition**: Auto-detect codes via Workers AI
 
-- **🧩 Email Parsing**: Match sender, recipient, subject or body conditions, configure per-mailbox rules, extract HTML tables and CSV attachments, preview processing steps, export detail rows, deliver results through durable Webhook jobs, and set history retention. See the [usage guide](doc/mailparser-usage.md) and [implementation plan](doc/mailparser-implementation-plan.md).
+- **🧩 Email Parsing**: Run multiple independent rule sets concurrently per mailbox, match sender, delivery address, subject or body conditions, extract HTML tables and CSV attachments, preview processing steps, export detail rows, deliver results through durable Webhook jobs, and set history retention. See the [usage guide](doc/mailparser-usage.md) and [implementation plan](doc/mailparser-implementation-plan.md).
 
 - **📈 Data Visualization**: Use ECharts to visualize system data, including user email growth.
 

@@ -1,7 +1,7 @@
 import http from '@/axios/index.js';
 
 export const parserAccounts = () => http.get('/parser/accounts');
-export const parserConfigs = () => http.get('/parser/configs');
+export const parserConfigs = accountId => http.get('/parser/configs', { params: { accountId } });
 export const parserSave = config => config.id ? http.put(`/parser/configs/${config.id}`, config) : http.post('/parser/configs', config);
 export const parserSamples = accountId => http.get('/parser/samples', { params: { accountId } });
 export const parserPreview = payload => http.post('/parser/preview', payload);

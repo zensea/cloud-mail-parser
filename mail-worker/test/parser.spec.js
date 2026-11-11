@@ -2,7 +2,7 @@ import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src';
 import parserService, { validateWebhook } from '../src/service/parser-service';
-import { initParserSchema } from '../src/init/parser-schema';
+import { initParserSchema, multiParserMigrationSql } from '../src/init/parser-schema';
 import jwtUtils from '../src/utils/jwt-utils';
 import { email as receiveEmail } from '../src/email/email';
 
@@ -544,6 +544,247 @@ describe('matching conditions across preview, receipt and durable recovery', () 
         const jobs = (await parserService.jobs(env.db, 1, { parserId: config.id })).rows;
         expect(jobs).toHaveLength(1); expect(jobs[0].data.order_id).toBe('MIME-1');
         expect((await env.db.prepare('SELECT COUNT(*) AS total FROM email').first()).total).toBe(5);
+    });
+});
+
+async function legacyConfigTable() {
+    await env.db.prepare('DROP TABLE parser_config').run();
+    await env.db.prepare(`CREATE TABLE parser_config (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES user(user_id) ON DELETE CASCADE,
+        account_id INTEGER NOT NULL REFERENCES account(account_id) ON DELETE CASCADE,
+        name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0, version INTEGER NOT NULL DEFAULT 1,
+        rules_json TEXT NOT NULL, webhook_url TEXT NOT NULL DEFAULT '', webhook_secret TEXT NOT NULL DEFAULT '',
+        start_email_id INTEGER NOT NULL DEFAULT 0, last_scanned_at INTEGER NOT NULL DEFAULT 0,
+        retention_days INTEGER NOT NULL DEFAULT 0, conditions_json TEXT NOT NULL DEFAULT '[]', scan_email_id INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(user_id,account_id))`).run();
+}
+
+async function parserSnapshot() {
+    const data = {};
+    for (const table of ['parser_config', 'parser_job', 'parser_delivery']) data[table] = (await env.db.prepare(`SELECT * FROM ${table} ORDER BY id`).all()).results;
+    return data;
+}
+
+describe('multi-rule schema migration preserves history', () => {
+    it('removes the legacy inline uniqueness without cascading history or reusing identifiers', async () => {
+        await legacyConfigTable();
+        const config = await parserService.saveConfig(env.db, 1, configuration({ webhookUrl: 'https://hooks.example.com/old', webhookSecret: 'Bearer preserved' }));
+        const job = await parserService.enqueue(env.db, 1, config.id, 1);
+        await parserService.enqueue(env.db, 1, config.id, 2);
+        await env.db.prepare("UPDATE parser_job SET status='parsed',result_json=?,dispatch_status='sent',parsed_at=100,sent_at=101,lease_token='preserved-lease',lease_until=102 WHERE id=?")
+            .bind(JSON.stringify({ data: { order_id: 'A-100' }, errors: [] }), job.id).run();
+        await env.db.prepare('INSERT INTO parser_delivery(job_id,user_id,attempt,status_code,created_at) VALUES(?,1,1,204,101)').bind(job.id).run();
+        await env.db.prepare("INSERT INTO parser_config(id,user_id,account_id,name,rules_json,created_at,updated_at) VALUES(900,2,2,'deleted','[]',0,0)").run();
+        await env.db.prepare('DELETE FROM parser_config WHERE id=900').run();
+        await env.db.prepare("INSERT INTO parser_job(id,parser_id,user_id,account_id,email_id,version,rules_json,input_json,available_at,created_at,updated_at) VALUES(900,?,1,1,900,1,'[]','{}',0,0,0)").bind(config.id).run();
+        await env.db.prepare('DELETE FROM parser_job WHERE id=900').run();
+        await env.db.prepare('INSERT INTO parser_delivery(id,job_id,user_id,attempt,status_code,created_at) VALUES(900,?,1,2,503,102)').bind(job.id).run();
+        await env.db.prepare('DELETE FROM parser_delivery WHERE id=900').run();
+        const before = await parserSnapshot();
+        await initParserSchema(env.db); await initParserSchema(env.db);
+        const after = await parserSnapshot();
+        expect(after.parser_config).toEqual(before.parser_config.map(row => ({ ...row, last_processed_at: 0 })));
+        expect(after.parser_job).toEqual(before.parser_job); expect(after.parser_delivery).toEqual(before.parser_delivery);
+        expect((await env.db.prepare('PRAGMA foreign_key_check').all()).results).toEqual([]);
+        const second = await parserService.saveConfig(env.db, 1, configuration({ name: '第二套', webhookUrl: 'https://hooks.example.com/new' }));
+        expect(second.id).toBeGreaterThan(900);
+        const next = await parserService.enqueue(env.db, 1, second.id, 1);
+        expect(next.id).toBeGreaterThan(900);
+        await parserService.process(env.db, { parserId: second.id, fetcher: async () => new Response(null, { status: 204 }) });
+        expect((await env.db.prepare('SELECT MAX(id) AS id FROM parser_delivery').first()).id).toBeGreaterThan(900);
+        await env.db.prepare('DELETE FROM account WHERE account_id=1').run();
+        expect((await env.db.prepare('SELECT COUNT(*) AS total FROM parser_job').first()).total).toBe(0);
+        expect((await env.db.prepare('SELECT COUNT(*) AS total FROM parser_delivery').first()).total).toBe(0);
+    });
+
+    it.each(['restore', 'indexes'])('rolls the rebuild back if %s fails and can safely retry', async stage => {
+        await legacyConfigTable();
+        const config = await parserService.saveConfig(env.db, 1, configuration());
+        await parserService.enqueue(env.db, 1, config.id, 1);
+        await parserService.enqueue(env.db, 1, config.id, 2);
+        await env.db.prepare('ALTER TABLE parser_config ADD COLUMN last_processed_at INTEGER NOT NULL DEFAULT 0').run();
+        const before = await parserSnapshot();
+        const columns = {};
+        for (const table of ['parser_config', 'parser_job', 'parser_delivery']) columns[table] = (await env.db.prepare(`PRAGMA table_info(${table})`).all()).results.map(column => column.name);
+        const sql = multiParserMigrationSql(columns);
+        if (stage === 'restore') sql.splice(sql.findIndex(statement => statement.startsWith('INSERT INTO parser_config')) + 1, 0, 'INSERT INTO parser_config SELECT * FROM parser_config');
+        else sql.splice(sql.findIndex(statement => statement.startsWith('CREATE INDEX')), 0, 'CREATE UNIQUE INDEX _parser_test_conflict ON parser_job(user_id)');
+        await expect(env.db.batch(sql.map(statement => env.db.prepare(statement)))).rejects.toThrow();
+        expect(await parserSnapshot()).toEqual(before);
+        expect((await env.db.prepare("SELECT name FROM sqlite_master WHERE name GLOB '_parser_multi_*'").all()).results).toEqual([]);
+        expect((await env.db.prepare('PRAGMA index_list(parser_config)').all()).results.some(index => index.unique)).toBe(true);
+        await initParserSchema(env.db);
+        expect((await parserService.saveConfig(env.db, 1, configuration())).id).not.toBe(config.id);
+        expect((await parserService.jobs(env.db, 1, { parserId: config.id })).rows).toHaveLength(2);
+    });
+});
+
+describe('independent rule sets in one mailbox', () => {
+    it('creates multiple sets through HTTP and scopes the mailbox list and ownership', async () => {
+        const first = (await api('/parser/configs', { method: 'POST', body: configuration({ name: '订单号' }) })).data;
+        const second = (await api('/parser/configs', { method: 'POST', body: configuration({ name: '金额' }) })).data;
+        expect(first.id).not.toBe(second.id); expect(first.version).toBe(1); expect(second.version).toBe(1);
+        expect((await api('/parser/configs?accountId=1')).data).toHaveLength(2);
+        expect((await api('/parser/configs?accountId=1', { userId: 2 })).code).toBe(404);
+        expect((await api('/parser/configs', { userId: 2 })).data).toEqual([]);
+        const updated = await parserService.saveConfig(env.db, 1, configuration({ name: '订单号 v2', version: 1 }), first.id);
+        expect(updated.version).toBe(2);
+        expect((await parserService.configs(env.db, 1)).find(row => row.id === second.id).version).toBe(1);
+    });
+
+    it('keeps submissions, snapshots, results and exports isolated for the same email', async () => {
+        const first = await parserService.saveConfig(env.db, 1, configuration());
+        const second = await parserService.saveConfig(env.db, 1, configuration({ name: '金额', rules: [{ key: 'amount', source: 'text', required: true,
+            filters: [{ type: 'regex', pattern: '金额: (\\d+)', group: 1 }, { type: 'number' }] }] }));
+        await env.db.prepare("UPDATE email SET text='订单号: A-100 金额: 12' WHERE email_id=1").run();
+        const [a, b] = await Promise.all([parserService.enqueue(env.db, 1, first.id, 1), parserService.enqueue(env.db, 1, second.id, 1)]);
+        expect(a.id).not.toBe(b.id);
+        expect((await parserService.enqueue(env.db, 1, first.id, 1)).id).toBe(a.id);
+        await env.db.prepare("UPDATE email SET text='changed' WHERE email_id=1").run();
+        await parserService.process(env.db);
+        expect((await parserService.job(env.db, 1, a.id)).data).toEqual({ order_id: 'A-100' });
+        expect((await parserService.job(env.db, 1, b.id)).data).toEqual({ amount: 12 });
+        expect((await parserService.exportRows(env.db, 1, { parserId: first.id })).rows.map(row => row.id)).toEqual([a.id]);
+        expect((await parserService.exportRows(env.db, 1, { parserId: second.id })).rows.map(row => row.id)).toEqual([b.id]);
+    });
+
+    it('fans out real MIME receipt to every matching enabled set without short-circuiting', async () => {
+        const first = await parserService.saveConfig(env.db, 1, configuration());
+        const second = await parserService.saveConfig(env.db, 1, configuration({ rules: [{ key: 'subject', source: 'subject', filters: [{ type: 'upper' }] }] }));
+        const excluded = await parserService.saveConfig(env.db, 1, configuration({ conditions: [matchCondition('subject', 'No match')] }));
+        const paused = await parserService.saveConfig(env.db, 1, configuration({ enabled: false }));
+        await env.kv.put('setting:', JSON.stringify({ receive: 0, emailPrefixFilter: '', noRecipient: 1, aiCode: 1, tgBotStatus: 1, forwardStatus: 1, webhookStatus: 1 }));
+        const raw = 'From: Shop <shop@example.test>\r\nTo: orders@example.test\r\nSubject: New order\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n订单号: MULTI-1';
+        const ctx = createExecutionContext(), reject = vi.fn();
+        await receiveEmail({ from: 'shop@example.test', to: 'orders@example.test', raw: new Response(raw).body, setReject: reject }, env, ctx);
+        await waitOnExecutionContext(ctx);
+        expect(reject).not.toHaveBeenCalled();
+        const a = (await parserService.jobs(env.db, 1, { parserId: first.id })).rows;
+        const b = (await parserService.jobs(env.db, 1, { parserId: second.id })).rows;
+        expect(a).toHaveLength(1); expect(b).toHaveLength(1); expect(a[0].emailId).toBe(b[0].emailId);
+        expect(a[0].data.order_id).toBe('MULTI-1'); expect(b[0].data.subject).toBe('NEW ORDER');
+        for (const config of [excluded, paused]) expect((await parserService.jobs(env.db, 1, { parserId: config.id })).rows).toEqual([]);
+    });
+
+    it('continues healthy registration and scanning when a sibling CSV store is unavailable', async () => {
+        const csv = await parserService.saveConfig(env.db, 1, configuration({ rules: csvRules }));
+        const text = await parserService.saveConfig(env.db, 1, configuration());
+        const email = await env.db.prepare("INSERT INTO email(user_id,account_id,text) VALUES(1,1,'订单号: SAFE-1') RETURNING *").first();
+        const key = await csvFile({ emailId: email.email_id }); await env.kv.delete(key);
+        expect(await parserService.receive(env.db, { ...email, userId: 1, accountId: 1, emailId: email.email_id }, { env })).toBe(true);
+        await parserService.process(env.db);
+        expect((await parserService.jobs(env.db, 1, { parserId: text.id })).rows[0].data.order_id).toBe('SAFE-1');
+        await parserService.reconcile(env.db, { env });
+        const cursors = (await env.db.prepare('SELECT id,scan_email_id FROM parser_config ORDER BY id').all()).results;
+        expect(cursors.find(row => row.id === csv.id).scan_email_id).toBeLessThan(email.email_id);
+        expect(cursors.find(row => row.id === text.id).scan_email_id).toBe(email.email_id);
+        await env.kv.put(key, 'item,qty\nRecovered,1'); await parserService.tick(env.db, { env });
+        expect((await parserService.jobs(env.db, 1, { parserId: csv.id })).rows[0].data.items).toEqual([{ item: 'Recovered', qty: '1' }]);
+        expect((await parserService.jobs(env.db, 1, { parserId: text.id })).rows).toHaveLength(1);
+    });
+
+    it('processes later rule sets while an earlier webhook is still waiting, with bounded concurrency', async () => {
+        const configs = [];
+        for (const path of ['slow', 'fast1', 'fast2', 'last']) configs.push(await parserService.saveConfig(env.db, 1, configuration({ name: path, webhookUrl: `https://hooks.example.com/${path}` })));
+        await env.db.prepare("INSERT INTO email(user_id,account_id,text) VALUES(1,1,'订单号: CONCURRENT-1')").run();
+        let release, reachedLast = false, active = 0, peak = 0;
+        const hold = new Promise(resolve => { release = resolve; });
+        const ids = new Set();
+        const running = parserService.tick(env.db, { fetcher: async (url, options) => {
+            active++; peak = Math.max(peak, active); ids.add(options.headers['Idempotency-Key']);
+            try {
+                if (url.endsWith('/slow')) await hold;
+                if (url.endsWith('/last')) reachedLast = true;
+                return new Response(null, { status: 204 });
+            } finally { active--; }
+        } });
+        try {
+            await vi.waitFor(() => expect(reachedLast).toBe(true), { timeout: 1500, interval: 20 });
+            const slow = (await parserService.jobs(env.db, 1, { parserId: configs[0].id })).rows[0];
+            expect(slow.dispatchStatus).toBe('sending');
+            await vi.waitFor(async () => expect((await parserService.jobs(env.db, 1, { parserId: configs[3].id })).rows[0].dispatchStatus).toBe('sent'));
+        } finally { release(); await running; }
+        expect(peak).toBeLessThanOrEqual(3); expect(ids.size).toBe(4);
+        for (const config of configs) expect((await parserService.jobs(env.db, 1, { parserId: config.id })).rows[0].dispatchStatus).toBe('sent');
+    });
+
+    it('isolates validation failures, manual processing and retry from sibling pending jobs', async () => {
+        const failed = await parserService.saveConfig(env.db, 1, configuration({ rules: [{ key: 'missing', source: 'subject', required: true, filters: [{ type: 'regex', pattern: 'not present' }] }] }));
+        const good = await parserService.saveConfig(env.db, 1, configuration());
+        const pending = await parserService.enqueue(env.db, 1, good.id, 1);
+        const result = (await api('/parser/enqueue', { method: 'POST', body: { parserId: failed.id, emailId: 1 } })).data;
+        expect((await parserService.job(env.db, 1, result.id)).status).toBe('failed');
+        expect((await parserService.job(env.db, 1, pending.id)).status).toBe('pending');
+        expect((await api(`/parser/jobs/${result.id}/retry`, { method: 'POST', body: { kind: 'parse' } })).code).toBe(200);
+        expect((await parserService.job(env.db, 1, pending.id)).attempts).toBe(0);
+        await parserService.process(env.db);
+        expect((await parserService.job(env.db, 1, pending.id)).data.order_id).toBe('A-100');
+    });
+
+    it('pauses only the selected set while siblings continue processing', async () => {
+        const paused = await parserService.saveConfig(env.db, 1, configuration());
+        const active = await parserService.saveConfig(env.db, 1, configuration());
+        const a = await parserService.enqueue(env.db, 1, paused.id, 1), b = await parserService.enqueue(env.db, 1, active.id, 1);
+        await parserService.saveConfig(env.db, 1, configuration({ version: 1, enabled: false }), paused.id);
+        await parserService.process(env.db);
+        expect((await parserService.job(env.db, 1, a.id)).status).toBe('pending');
+        expect((await parserService.job(env.db, 1, b.id)).status).toBe('parsed');
+    });
+
+    it('keeps webhook failures, credentials and manual delivery retries isolated', async () => {
+        const a = await parserService.saveConfig(env.db, 1, configuration({ webhookUrl: 'https://hooks.example.com/a', webhookSecret: 'Bearer A' }));
+        const b = await parserService.saveConfig(env.db, 1, configuration({ webhookUrl: 'https://hooks.example.com/b', webhookSecret: 'Bearer B' }));
+        const ja = await parserService.enqueue(env.db, 1, a.id, 1), jb = await parserService.enqueue(env.db, 1, b.id, 1);
+        const fetcher = vi.fn(async (url, options) => {
+            expect(options.headers.Authorization).toBe(url.endsWith('/a') ? 'Bearer A' : 'Bearer B');
+            return new Response(null, { status: url.endsWith('/a') ? 503 : 204 });
+        });
+        await parserService.process(env.db, { fetcher });
+        expect((await parserService.job(env.db, 1, ja.id)).dispatchStatus).toBe('pending');
+        const sibling = await parserService.job(env.db, 1, jb.id);
+        expect(sibling.dispatchStatus).toBe('sent');
+        await env.db.prepare("UPDATE parser_job SET dispatch_status='failed' WHERE id=?").bind(ja.id).run();
+        const retry = await parserService.retry(env.db, 1, ja.id, 'dispatch');
+        await parserService.process(env.db, { parserId: retry.parserId, fetcher: async (url, options) => {
+            expect(url).toBe('https://hooks.example.com/a'); expect(options.headers.Authorization).toBe('Bearer A');
+            expect(options.headers['Idempotency-Key']).toBe(`parser-job-${ja.id}`);
+            return new Response(null, { status: 204 });
+        } });
+        expect((await parserService.job(env.db, 1, ja.id)).dispatchStatus).toBe('sent');
+        expect(await parserService.job(env.db, 1, jb.id)).toEqual(sibling);
+    });
+
+    it('allocates each set its own parse budget rather than letting a backlog monopolize a round', async () => {
+        const backlog = await parserService.saveConfig(env.db, 1, configuration()), other = await parserService.saveConfig(env.db, 1, configuration());
+        for (let index = 0; index < 6; index++) {
+            const email = await env.db.prepare("INSERT INTO email(user_id,account_id,text) VALUES(1,1,'订单号: BULK-1') RETURNING email_id").first();
+            await parserService.enqueue(env.db, 1, backlog.id, email.email_id);
+        }
+        const job = await parserService.enqueue(env.db, 1, other.id, 1);
+        await parserService.process(env.db);
+        expect((await parserService.job(env.db, 1, job.id)).status).toBe('parsed');
+        const rows = (await parserService.jobs(env.db, 1, { parserId: backlog.id })).rows;
+        expect(rows.filter(row => row.status === 'parsed')).toHaveLength(5); expect(rows.filter(row => row.status === 'pending')).toHaveLength(1);
+    });
+
+    it('rotates scheduled batches across more than ten rule sets', async () => {
+        const configs = [];
+        for (let index = 0; index < 12; index++) configs.push(await parserService.saveConfig(env.db, 1, configuration({ name: `set-${index}` })));
+        await env.db.prepare("INSERT INTO email(user_id,account_id,text) VALUES(1,1,'订单号: FAIR-1')").run();
+        await parserService.tick(env.db);
+        expect((await env.db.prepare('SELECT COUNT(*) AS total FROM parser_job').first()).total).toBe(10);
+        await parserService.tick(env.db);
+        expect((await env.db.prepare("SELECT COUNT(*) AS total FROM parser_job WHERE status='parsed'").first()).total).toBe(12);
+        for (const config of configs) expect((await parserService.jobs(env.db, 1, { parserId: config.id })).rows).toHaveLength(1);
+    });
+
+    it('applies retention only to the rule set whose policy expired', async () => {
+        const expired = await parserService.saveConfig(env.db, 1, configuration({ retentionDays: 1 }));
+        const kept = await parserService.saveConfig(env.db, 1, configuration({ retentionDays: 0 }));
+        const a = await parserService.enqueue(env.db, 1, expired.id, 1), b = await parserService.enqueue(env.db, 1, kept.id, 1);
+        await parserService.process(env.db); await env.db.prepare('UPDATE parser_job SET updated_at=0').run();
+        expect(await parserService.cleanup(env.db)).toBe(1);
+        expect((await parserService.job(env.db, 1, a.id)).status).toBe('expired'); expect((await parserService.job(env.db, 1, b.id)).status).toBe('parsed');
     });
 });
 

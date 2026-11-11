@@ -93,8 +93,10 @@ const parserService = {
         return results;
     },
 
-    async configs(db, userId) {
-        const { results } = await db.prepare(`SELECT ${configFields} FROM parser_config WHERE user_id = ? ORDER BY id DESC`).bind(userId).all();
+    async configs(db, userId, accountId) {
+        const mailbox = accountId === undefined ? 0 : positiveId(accountId);
+        if (mailbox) await ownAccount(db, mailbox, userId);
+        const { results } = await db.prepare(`SELECT ${configFields} FROM parser_config WHERE user_id = ? AND (?=0 OR account_id=?) ORDER BY id DESC`).bind(userId, mailbox, mailbox).all();
         return results.map(configView);
     },
 
@@ -129,10 +131,8 @@ const parserService = {
             return configView(row);
         }
         const row = await db.prepare(`INSERT INTO parser_config (user_id,account_id,name,enabled,rules_json,webhook_url,webhook_secret,retention_days,conditions_json,start_email_id,created_at,updated_at)
-            SELECT ?,?,?,?,?,?,?,?,?,COALESCE(MAX(email_id),0),?,? FROM email WHERE account_id = ?
-            ON CONFLICT(user_id,account_id) DO NOTHING RETURNING *`)
+            SELECT ?,?,?,?,?,?,?,?,?,COALESCE(MAX(email_id),0),?,? FROM email WHERE account_id = ? RETURNING *`)
             .bind(userId, accountId, params.name.trim(), Number(params.enabled), JSON.stringify(rules), url, params.webhookSecret || '', params.retentionDays ?? 0, JSON.stringify(conditions ?? []), now, now, accountId).first();
-        if (!row) throw new BizError('This mailbox already has a parser', 409);
         return configView(row);
     },
 
@@ -171,39 +171,21 @@ const parserService = {
 
     async receive(db, email, options) {
         if (!email.userId || !email.accountId) return;
-        const config = await db.prepare('SELECT * FROM parser_config WHERE user_id=? AND account_id=? AND enabled=1').bind(email.userId, email.accountId).first();
-        return config ? !!(await addJob(db, config, email, options)).job : false;
+        const { results: configs } = await db.prepare('SELECT * FROM parser_config WHERE user_id=? AND account_id=? AND enabled=1 ORDER BY id').bind(email.userId, email.accountId).all();
+        const results = await runConfigs(configs, async config => !!(await addJob(db, config, email, options)).job);
+        return results.some(Boolean);
     },
 
     async reconcile(db, options) {
-        const { results: configs } = await db.prepare(`SELECT c.* FROM parser_config c JOIN account a ON a.account_id=c.account_id AND a.user_id=c.user_id AND a.is_del=0
-            JOIN user u ON u.user_id=c.user_id AND u.status=0 AND u.is_del=0
-            WHERE c.enabled=1 ORDER BY c.last_scanned_at,c.id LIMIT 10`).all();
-        for (const config of configs) {
-            const { results: emails } = await db.prepare(`SELECT e.* FROM email e WHERE e.user_id=? AND e.account_id=? AND e.email_id>? AND e.email_id>?
-                AND e.type=0 ORDER BY e.email_id LIMIT 10`).bind(config.user_id, config.account_id, config.start_email_id, config.scan_email_id).all();
-            for (const email of emails) {
-                // A MIME receipt may complete out of order. Never scan past an unfinished receipt.
-                if (email.status === emailConst.status.SAVING) break;
-                if (email.status === emailConst.status.RECEIVE && email.is_del === 0) {
-                    const existing = await db.prepare('SELECT id FROM parser_job WHERE parser_id=? AND email_id=? LIMIT 1').bind(config.id, email.email_id).first();
-                    if (!existing) {
-                        try {
-                            const result = await addJob(db, config, email, options);
-                            if (!result.job && !result.match) break; // Configuration changed while registering.
-                        } catch (error) {
-                            if (error.code !== 503) throw error;
-                            console.error('Parser CSV storage unavailable; reconciliation will retry');
-                            break;
-                        }
-                    }
-                }
-                const advanced = await db.prepare('UPDATE parser_config SET scan_email_id=MAX(scan_email_id,?) WHERE id=? AND version=? AND enabled=1')
-                    .bind(email.email_id, config.id, config.version).run();
-                if (!advanced.meta.changes) break;
-            }
-            await db.prepare('UPDATE parser_config SET last_scanned_at=? WHERE id=?').bind(Date.now(), config.id).run();
-        }
+        await runConfigs(await scanConfigs(db), config => reconcileConfig(db, config, options));
+    },
+
+    async tick(db, options = {}) {
+        await recoverLeases(db);
+        await runConfigs(await scanConfigs(db), async config => {
+            await reconcileConfig(db, config, options);
+            await processConfig(db, config.id, options);
+        });
     },
 
     async jobs(db, userId, params) {
@@ -242,6 +224,7 @@ const parserService = {
                 WHERE id=? AND user_id=? AND status='parsed' AND dispatch_status='failed' RETURNING id`).bind(now, now, row.id, userId).first();
         } else throw new BizError('Invalid retry kind', 400);
         if (!updated) throw new BizError('Only failed jobs can be retried', 409);
+        return { parserId: row.parser_id };
     },
 
     async exportRows(db, userId, params) {
@@ -286,13 +269,22 @@ const parserService = {
         return batch[1].meta.changes;
     },
 
-    async process(db, { userId = 0, fetcher = fetch } = {}) {
-        // Expired leases are reclaimed, with a bounded number of attempts.
-        const now = Date.now();
-        await db.prepare(`UPDATE parser_job SET status='failed',error='Worker interrupted too many times',lease_token='',updated_at=?
-            WHERE status='processing' AND lease_until<=? AND attempts>=?`).bind(now, now, MAX_PARSE_ATTEMPTS).run();
-        await db.prepare(`UPDATE parser_job SET dispatch_status='failed',dispatch_error='Delivery interrupted too many times',dispatch_lease_token='',updated_at=?
-            WHERE dispatch_status='sending' AND dispatch_lease_until<=? AND dispatch_attempts>=?`).bind(now, now, MAX_DISPATCH_ATTEMPTS).run();
+    async process(db, { userId = 0, parserId = 0, fetcher = fetch } = {}) {
+        await recoverLeases(db, { userId, parserId });
+        const { results: configs } = await db.prepare(`SELECT c.id FROM parser_config c
+            JOIN account a ON a.account_id=c.account_id AND a.user_id=c.user_id AND a.is_del=0
+            JOIN user u ON u.user_id=c.user_id AND u.status=0 AND u.is_del=0
+            WHERE c.enabled=1 AND (?=0 OR c.user_id=?) AND (?=0 OR c.id=?) AND EXISTS (
+                SELECT 1 FROM parser_job j WHERE j.parser_id=c.id AND (
+                    (j.status='pending' AND j.available_at<=?) OR (j.status='processing' AND j.lease_until<=?) OR
+                    (j.status='parsed' AND ((j.dispatch_status='pending' AND j.dispatch_available_at<=?) OR (j.dispatch_status='sending' AND j.dispatch_lease_until<=?)))))
+            ORDER BY c.last_processed_at,c.id LIMIT 10`).bind(userId, userId, parserId, parserId, Date.now(), Date.now(), Date.now(), Date.now()).all();
+        await runConfigs(configs, config => processConfig(db, config.id, { fetcher }));
+    }
+};
+
+async function processConfig(db, parserId, { fetcher = fetch } = {}) {
+        await db.prepare('UPDATE parser_config SET last_processed_at=? WHERE id=?').bind(Date.now(), parserId).run();
         for (let index = 0; index < 5; index++) {
             const time = Date.now();
             const token = crypto.randomUUID();
@@ -300,8 +292,8 @@ const parserService = {
                 SELECT j.id FROM parser_job j JOIN parser_config c ON c.id=j.parser_id AND c.user_id=j.user_id AND c.enabled=1
                 JOIN account a ON a.account_id=j.account_id AND a.user_id=j.user_id AND a.is_del=0
                 JOIN user u ON u.user_id=j.user_id AND u.status=0 AND u.is_del=0
-                WHERE (?=0 OR j.user_id=?) AND j.attempts<? AND ((j.status='pending' AND j.available_at<=?) OR (j.status='processing' AND j.lease_until<=?))
-                ORDER BY j.id LIMIT 1) RETURNING *`).bind(token, time + LEASE_MS, time, userId, userId, MAX_PARSE_ATTEMPTS, time, time).first();
+                WHERE j.parser_id=? AND j.attempts<? AND ((j.status='pending' AND j.available_at<=?) OR (j.status='processing' AND j.lease_until<=?))
+                ORDER BY j.id LIMIT 1) RETURNING *`).bind(token, time + LEASE_MS, time, parserId, MAX_PARSE_ATTEMPTS, time, time).first();
             if (!job) break;
             let result;
             let error = '';
@@ -323,9 +315,9 @@ const parserService = {
                 SELECT j.id FROM parser_job j JOIN parser_config c ON c.id=j.parser_id AND c.user_id=j.user_id AND c.enabled=1
                 JOIN account a ON a.account_id=j.account_id AND a.user_id=j.user_id AND a.is_del=0
                 JOIN user u ON u.user_id=j.user_id AND u.status=0 AND u.is_del=0
-                WHERE (?=0 OR j.user_id=?) AND j.status='parsed' AND j.dispatch_attempts<?
+                WHERE j.parser_id=? AND j.status='parsed' AND j.dispatch_attempts<?
                 AND ((j.dispatch_status='pending' AND j.dispatch_available_at<=?) OR (j.dispatch_status='sending' AND j.dispatch_lease_until<=?)) ORDER BY j.id LIMIT 1) RETURNING *`)
-                .bind(token, time + LEASE_MS, time, userId, userId, MAX_DISPATCH_ATTEMPTS, time, time).first();
+                .bind(token, time + LEASE_MS, time, parserId, MAX_DISPATCH_ATTEMPTS, time, time).first();
             if (!job) break;
             let statusCode = null;
             let error = '';
@@ -355,7 +347,62 @@ const parserService = {
                     .bind(nextStatus, error, finished + 60000 * 2 ** (job.dispatch_attempts - 1), !error ? finished : null, finished, job.id, token)
             ]);
         }
+}
+
+async function runConfigs(configs, handler) {
+    const results = new Array(configs.length);
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(3, configs.length) }, async () => {
+        while (next < configs.length) {
+            const index = next++;
+            try { results[index] = await handler(configs[index]); }
+            catch { console.error('Parser rule set failed; durable recovery will retry', configs[index].id); }
+        }
+    }));
+    return results;
+}
+
+async function scanConfigs(db) {
+    return (await db.prepare(`SELECT c.* FROM parser_config c JOIN account a ON a.account_id=c.account_id AND a.user_id=c.user_id AND a.is_del=0
+        JOIN user u ON u.user_id=c.user_id AND u.status=0 AND u.is_del=0
+        WHERE c.enabled=1 ORDER BY c.last_scanned_at,c.id LIMIT 10`).all()).results;
+}
+
+async function reconcileConfig(db, config, options) {
+    const { results: emails } = await db.prepare(`SELECT e.* FROM email e WHERE e.user_id=? AND e.account_id=? AND e.email_id>? AND e.email_id>?
+        AND e.type=0 ORDER BY e.email_id LIMIT 10`).bind(config.user_id, config.account_id, config.start_email_id, config.scan_email_id).all();
+    for (const email of emails) {
+        if (email.status === emailConst.status.SAVING) break;
+        if (email.status === emailConst.status.RECEIVE && email.is_del === 0) {
+            const existing = await db.prepare('SELECT id FROM parser_job WHERE parser_id=? AND email_id=? LIMIT 1').bind(config.id, email.email_id).first();
+            if (!existing) {
+                try {
+                    const result = await addJob(db, config, email, options);
+                    if (!result.job && !result.match) break;
+                } catch (error) {
+                    if (error.code !== 503) throw error;
+                    console.error('Parser CSV storage unavailable; reconciliation will retry');
+                    break;
+                }
+            }
+        }
+        const advanced = await db.prepare('UPDATE parser_config SET scan_email_id=MAX(scan_email_id,?) WHERE id=? AND version=? AND enabled=1')
+            .bind(email.email_id, config.id, config.version).run();
+        if (!advanced.meta.changes) break;
     }
-};
+    await db.prepare('UPDATE parser_config SET last_scanned_at=? WHERE id=?').bind(Date.now(), config.id).run();
+}
+
+async function recoverLeases(db, { userId = 0, parserId = 0 } = {}) {
+    const now = Date.now();
+    await db.batch([
+        db.prepare(`UPDATE parser_job SET status='failed',error='Worker interrupted too many times',lease_token='',updated_at=?
+            WHERE status='processing' AND lease_until<=? AND attempts>=? AND (?=0 OR user_id=?) AND (?=0 OR parser_id=?)`)
+            .bind(now, now, MAX_PARSE_ATTEMPTS, userId, userId, parserId, parserId),
+        db.prepare(`UPDATE parser_job SET dispatch_status='failed',dispatch_error='Delivery interrupted too many times',dispatch_lease_token='',updated_at=?
+            WHERE dispatch_status='sending' AND dispatch_lease_until<=? AND dispatch_attempts>=? AND (?=0 OR user_id=?) AND (?=0 OR parser_id=?)`)
+            .bind(now, now, MAX_DISPATCH_ATTEMPTS, userId, userId, parserId, parserId)
+    ]);
+}
 
 export default parserService;

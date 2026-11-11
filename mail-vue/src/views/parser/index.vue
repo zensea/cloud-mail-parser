@@ -9,12 +9,19 @@
     <template v-if="accounts.length">
       <div class="mailbox-bar">
         <label for="parser-mailbox">{{ t('parser.mailbox') }}</label>
-        <el-select id="parser-mailbox" :model-value="selectedAccount" filterable :disabled="busy.saving || busy.exporting" @update:model-value="changeAccount">
+        <el-select id="parser-mailbox" :model-value="selectedAccount" filterable :disabled="changingRuleBlocked" @update:model-value="changeAccount">
           <el-option v-for="account in accounts" :key="account.accountId" :value="account.accountId" :label="account.email" />
         </el-select>
+        <label for="parser-config">{{ t('parser.ruleSet') }}</label>
+        <el-select id="parser-config" :model-value="draft.id || 0" filterable :disabled="changingRuleBlocked" @update:model-value="changeRuleSet">
+          <el-option v-if="!draft.id" :value="0" :label="t('parser.newRuleSet')" />
+          <el-option v-for="config in configs" :key="config.id" :value="config.id" :label="`#${config.id} ${config.name}`" />
+        </el-select>
+        <el-button :disabled="changingRuleBlocked" @click="newRuleSet">{{ t('parser.addRuleSet') }}</el-button>
         <el-tag v-if="draft.id" type="info">v{{ draft.version }}</el-tag>
         <el-tag v-if="dirty" type="warning">{{ t('parser.unsaved') }}</el-tag>
       </div>
+      <p class="help">{{ t('parser.ruleSetHelp') }}</p>
       <el-tabs v-model="activeTab">
         <el-tab-pane :label="t('parser.configuration')" name="configuration">
           <div class="workspace">
@@ -88,7 +95,7 @@
                 <template v-if="preview.match && draft.conditions.length">
                   <el-alert :title="t(preview.match.matched ? 'parser.matchPassed' : 'parser.matchSkipped')" :type="preview.match.matched ? 'success' : 'info'" :closable="false" show-icon />
                   <ul class="match-checks"><li v-for="check in preview.match.checks" :key="check.index">
-                    {{ check.matched ? '✓' : '✕' }} {{ t(`parser.sources.${check.source}`) }} · {{ t(`parser.matchOperators.${check.operator}`) }}: {{ draft.conditions[check.index]?.value }}
+                    {{ check.matched ? '✓' : '✕' }} {{ check.source === 'to' ? t('parser.deliveryAddress') : t(`parser.sources.${check.source}`) }} · {{ t(`parser.matchOperators.${check.operator}`) }}: {{ draft.conditions[check.index]?.value }}
                   </li></ul>
                 </template>
                 <template v-if="preview.match?.matched !== false">
@@ -200,6 +207,9 @@ const exportTableField = ref('');
 const exportBatchSize = ref(100);
 const exportTables = computed(() => configs.value.find(config => config.id === draft.value.id)?.rules.filter(rule => ['htmlTable', 'csvAttachment'].includes(rule.source)) || []);
 const dirty = computed(() => baseline.value && JSON.stringify(draft.value) !== baseline.value);
+const changingRuleBlocked = computed(() => busy.loading || busy.saving || busy.exporting || busy.submitting || busy.retrying || busy.detail);
+let jobRequest = 0;
+let jobContext = '';
 let poll;
 const pretty = value => value == null ? '—' : JSON.stringify(value, null, 2);
 const tagType = status => ({ parsed: 'success', sent: 'success', failed: 'danger', none: 'info', expired: 'info' }[status] || 'warning');
@@ -217,35 +227,47 @@ async function confirmDiscard() {
   catch { return false; }
 }
 function resetExports() { for (const format of ['csv', 'json']) { exportCursor[format] = '0_0'; exportMore[format] = false; } }
-async function selectAccount(accountId) {
-  selectedAccount.value = accountId;
-  const saved = configs.value.find(config => config.accountId === accountId);
+async function selectRuleSet(saved) {
   draft.value = saved ? { ...JSON.parse(JSON.stringify(saved)), webhookSecret: '', clearWebhookSecret: false } : {
-    accountId, name: t('parser.defaultName'), enabled: false, retentionDays: 30, conditions: [], webhookUrl: '', webhookSecret: '', clearWebhookSecret: false,
+    accountId: selectedAccount.value, name: `${t('parser.defaultName')}${configs.value.length ? ` ${configs.value.length + 1}` : ''}`, enabled: false, retentionDays: 30, conditions: [], webhookUrl: '', webhookSecret: '', clearWebhookSecret: false,
     rules: [{ key: 'order_id', source: 'text', required: true, filters: [{ type: 'regex', pattern: '(?:订单号|Order ID): ([A-Z0-9-]+)', flags: 'm', group: 1 }] }]
   };
   baseline.value = JSON.stringify(draft.value);
-  preview.value = null; selectedSample.value = 0; jobs.value = []; cursor.value = 0; cursorStack.value = []; hasMore.value = false;
+  preview.value = null; jobs.value = []; cursor.value = 0; cursorStack.value = []; hasMore.value = false;
+  detail.value = null; drawerOpen.value = false; jobRequest++; busy.jobs = false;
   exportTableField.value = ''; resetExports();
-  samples.value = await parserSamples(accountId);
   if (draft.value.id) await loadJobs();
+  else activeTab.value = 'configuration';
+}
+async function selectAccount(accountId, parserId = 0) {
+  const [mailboxConfigs, mailboxSamples] = await Promise.all([parserConfigs(accountId), parserSamples(accountId)]);
+  selectedAccount.value = accountId; selectedSample.value = 0;
+  configs.value = mailboxConfigs; samples.value = mailboxSamples;
+  await selectRuleSet(configs.value.find(config => config.id === parserId) || configs.value[0]);
 }
 async function changeAccount(accountId) {
   if (await confirmDiscard()) await run('loading', () => selectAccount(accountId));
 }
+async function changeRuleSet(id) {
+  if (id === (draft.value.id || 0)) return;
+  if (await confirmDiscard()) await run('loading', () => selectRuleSet(configs.value.find(config => config.id === id)));
+}
+async function newRuleSet() {
+  if (await confirmDiscard()) await run('loading', () => selectRuleSet(null));
+}
 async function reload() {
   if (!await confirmDiscard()) return;
   await run('loading', async () => {
-    [accounts.value, configs.value] = await Promise.all([parserAccounts(), parserConfigs()]);
+    accounts.value = await parserAccounts();
     const desired = selectedAccount.value || useAccountStore().currentAccountId;
     const account = accounts.value.find(item => item.accountId === desired) || accounts.value[0];
-    if (account) await selectAccount(account.accountId);
+    if (account) await selectAccount(account.accountId, draft.value.id);
   });
 }
 async function save() {
   await run('saving', async () => {
     const saved = await parserSave(draft.value);
-    configs.value = [...configs.value.filter(config => config.id !== saved.id), saved];
+    configs.value = [saved, ...configs.value.filter(config => config.id !== saved.id)].sort((a, b) => b.id - a.id);
     draft.value = { ...saved, webhookSecret: '', clearWebhookSecret: false };
     baseline.value = JSON.stringify(draft.value);
     resetExports();
@@ -260,7 +282,7 @@ async function runPreview() {
   });
 }
 function previewPayload() {
-  return { accountId: selectedAccount.value, rules: draft.value.rules, conditions: draft.value.conditions,
+  return { accountId: selectedAccount.value, parserId: draft.value.id || 0, rules: draft.value.rules, conditions: draft.value.conditions,
     ...(selectedSample.value ? { emailId: selectedSample.value } : { sample: { ...sampleInput, attachments: hasCsvRule.value ? [sampleCsv] : [] } }) };
 }
 async function submit() {
@@ -274,11 +296,19 @@ async function submit() {
   });
 }
 async function loadJobs() {
-  if (!draft.value.id) return;
-  await run('jobs', async () => {
-    const data = await parserJobs(draft.value.id, cursor.value);
+  const parserId = draft.value.id, pageCursor = cursor.value;
+  if (!parserId) return;
+  const context = `${parserId}:${pageCursor}`;
+  if (busy.jobs && jobContext === context) return;
+  jobContext = context;
+  const request = ++jobRequest;
+  busy.jobs = true;
+  try {
+    const data = await parserJobs(parserId, pageCursor);
+    if (request !== jobRequest || draft.value.id !== parserId || cursor.value !== pageCursor) return;
     jobs.value = data.rows; hasMore.value = data.hasMore; nextCursor.value = data.nextCursor;
-  });
+  } catch (reason) { if (request === jobRequest) error.value = reason.message || t('parser.loadFailed'); }
+  finally { if (request === jobRequest) busy.jobs = false; }
 }
 async function nextPage() { cursorStack.value.push(cursor.value); cursor.value = nextCursor.value; await loadJobs(); }
 async function previousPage() { cursor.value = cursorStack.value.pop() || 0; await loadJobs(); }
@@ -297,7 +327,7 @@ async function download(format) {
     const data = await parserDownload(draft.value.id, format, exportCursor[format], format === 'csv' ? exportTableField.value : '', exportBatchSize.value);
     const url = URL.createObjectURL(data.blob);
     const link = document.createElement('a');
-    link.href = url; link.download = `parsed-emails-${Date.now()}.${format}`;
+    link.href = url; link.download = `parsed-emails-${draft.value.id}-${Date.now()}.${format}`;
     document.body.appendChild(link); link.click(); link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
     exportCursor[format] = data.hasMore ? data.nextCursor : '0_0';
