@@ -5,6 +5,8 @@ import parserService, { validateWebhook } from '../src/service/parser-service';
 import { initParserSchema, multiParserMigrationSql } from '../src/init/parser-schema';
 import jwtUtils from '../src/utils/jwt-utils';
 import { email as receiveEmail } from '../src/email/email';
+import { downloadOptions, downloadWindow } from '../src/lib/parser-export';
+import parserDownloads from '../src/service/parser-download-service';
 
 const rules = [{ key: 'order_id', source: 'text', required: true,
     filters: [{ type: 'regex', pattern: '订单号: ([A-Z0-9-]+)', group: 1 }] }];
@@ -785,6 +787,277 @@ describe('independent rule sets in one mailbox', () => {
         await parserService.process(env.db); await env.db.prepare('UPDATE parser_job SET updated_at=0').run();
         expect(await parserService.cleanup(env.db)).toBe(1);
         expect((await parserService.job(env.db, 1, a.id)).status).toBe('expired'); expect((await parserService.job(env.db, 1, b.id)).status).toBe('parsed');
+    });
+});
+
+describe('manual downloads and permanent download links', () => {
+    async function fixture() {
+        const config = await parserService.saveConfig(env.db, 1, configuration({ rules: [
+            ...rules, { key: 'subject', source: 'subject', required: false, filters: [] }
+        ] }));
+        const first = await parserService.enqueue(env.db, 1, config.id, 1), second = await parserService.enqueue(env.db, 1, config.id, 2);
+        await parserService.process(env.db, { parserId: config.id });
+        await env.db.batch([env.db.prepare('UPDATE parser_job SET parsed_at=100 WHERE id=?').bind(first.id), env.db.prepare('UPDATE parser_job SET parsed_at=200 WHERE id=?').bind(second.id)]);
+        return { config, first, second };
+    }
+    async function createLink(config, options = {}) {
+        const response = await api('/parser/download-links', { method: 'POST', body: { parserId: config.id, name: '订单下载', format: 'json', ...options } });
+        expect(response.code).toBe(200);
+        return response.data;
+    }
+    const publicGet = (link, query = '') => api(`${link.path}${query}`, { userId: 0, raw: true });
+
+    it('keeps existing manual CSV/JSON exports and supports fields, time range and pagination', async () => {
+        const { config, second } = await fixture();
+        const json = await api(`/parser/export?parserId=${config.id}&fields=order_id&fromTime=150&toTime=250`);
+        expect(json.data.rows).toEqual([{ id: second.id, emailId: 2, version: 1, parsedAt: 200, data: { order_id: 'B-200' } }]);
+        const csv = await api(`/parser/export?parserId=${config.id}&format=csv&fields=order_id&size=1`, { raw: true });
+        expect(csv.headers.get('X-Has-More')).toBe('true');
+        const text = await csv.text(); expect(text).toContain('A-100'); expect(text).not.toContain('B-200'); expect(text).not.toContain('subject');
+        expect(csv.headers.get('Content-Disposition')).toContain(`parsed-emails-${config.id}.csv`);
+    });
+
+    it('requires sessions for link management and prevents other owners from changing links', async () => {
+        const { config } = await fixture(), link = await createLink(config);
+        for (const [method, path, body] of [
+            ['GET', `/parser/download-links?parserId=${config.id}`], ['POST', '/parser/download-links', { parserId: config.id, name: 'x', format: 'json' }],
+            ['POST', `/parser/download-links/${link.id}/rotate`], ['DELETE', `/parser/download-links/${link.id}`]
+        ]) {
+            expect((await api(path, { method, body, userId: 0 })).code).toBe(401);
+            expect((await api(path, { method, body, userId: 2 })).code).toBe(404);
+        }
+        expect((await api(link.path, { method: 'POST', userId: 0 })).code).toBe(401);
+        expect((await api('/parser/configs', { userId: 0 })).code).toBe(401);
+    });
+
+    it('creates an anonymous read-only link and exposes the recoverable URL only to its owner', async () => {
+        const { config } = await fixture(), link = await createLink(config);
+        const secret = link.path.split('/').at(-1); expect(secret).toMatch(/^[a-f0-9]{64}$/);
+        const stored = await env.db.prepare('SELECT * FROM parser_download WHERE id=?').bind(link.id).first();
+        expect(stored.token_hash).toMatch(/^[a-f0-9]{64}$/); expect(JSON.stringify(stored)).not.toContain(secret);
+        const listed = await api(`/parser/download-links?parserId=${config.id}`);
+        expect(listed.data).toHaveLength(1); expect(listed.data[0].path).toBe(link.path);
+        expect(JSON.stringify(listed)).not.toContain('token_hash'); expect(JSON.stringify(listed)).not.toContain('token_encrypted');
+        expect(stored.token_encrypted).toBeTruthy();
+        for (let index = 0; index < 2; index++) {
+            const response = await publicGet(link); expect(response.status).toBe(200);
+            expect((await response.json()).data.rows.map(row => row.data.order_id)).toEqual(['A-100', 'B-200']);
+            expect(response.headers.get('Cache-Control')).toBe('no-store'); expect(response.headers.get('Referrer-Policy')).toBe('no-referrer');
+        }
+        expect((await parserService.jobs(env.db, 1, { parserId: config.id })).rows).toHaveLength(2);
+        expect((await api(`/parser-download/${'0'.repeat(64)}`, { userId: 0, raw: true })).status).toBe(404);
+    });
+
+    it('fixes rule set, fields, time, format and batch size regardless of caller overrides', async () => {
+        const { config, second } = await fixture();
+        const other = await parserService.saveConfig(env.db, 1, configuration({ name: '其他规则' }));
+        await parserService.enqueue(env.db, 1, other.id, 1); await parserService.process(env.db, { parserId: other.id });
+        const link = await createLink(config, { fields: ['order_id'], fromTime: 150, toTime: 250, size: 1 });
+        const response = await publicGet(link, `?parserId=${other.id}&fields=subject&fromTime=0&toTime=0&format=csv&size=100`);
+        expect(response.headers.get('Content-Type')).toContain('application/json');
+        const data = (await response.json()).data;
+        expect(data.rows).toEqual([{ id: second.id, emailId: 2, version: 1, parsedAt: 200, data: { order_id: 'B-200' } }]);
+    });
+
+    it('returns new results on the same URL and supports stable caller-controlled pagination', async () => {
+        const { config, first, second } = await fixture(), link = await createLink(config, { size: 1 });
+        const firstResponse = await publicGet(link), page = (await firstResponse.json()).data;
+        expect(page.rows[0].id).toBe(first.id); expect(page.hasMore).toBe(true);
+        expect(firstResponse.headers.get('X-Next-Cursor')).toBe(page.nextCursor);
+        const next = (await (await publicGet(link, `?cursor=${page.nextCursor}`)).json()).data;
+        expect(next.rows[0].id).toBe(second.id); expect(next.hasMore).toBe(false);
+        await env.db.prepare("INSERT INTO email(email_id,user_id,account_id,text) VALUES(4,1,1,'订单号: D-400')").run();
+        const job = await parserService.enqueue(env.db, 1, config.id, 4); await parserService.process(env.db, { parserId: config.id });
+        expect((await (await publicGet(link, `?cursor=${next.nextCursor}`)).json()).data.rows[0].id).toBe(job.id);
+        expect((await publicGet(link, '?cursor=invalid')).status).toBe(400);
+    });
+
+    it('downloads CSV table details with formula protection, Unicode and continuation headers', async () => {
+        const { config, first } = await fixture();
+        await env.db.prepare('UPDATE parser_job SET result_json=? WHERE id=?').bind(JSON.stringify({ data: { order_id: '中文', items: [{ item: '=1+1' }, { item: '正常' }], secret: 'excluded' } }), first.id).run();
+        const link = await createLink(config, { format: 'csv', fields: ['order_id', 'items'], tableField: 'items' });
+        const response = await publicGet(link); expect(response.status).toBe(200);
+        const text = await response.text(); expect(text).toContain('中文'); expect(text).toContain("'=1+1"); expect(text).toContain('正常'); expect(text).not.toContain('excluded');
+        expect(response.headers.get('X-Has-More')).toBe('false');
+        expect(response.headers.get('Access-Control-Expose-Headers')).toContain('X-Next-Cursor');
+        expect(response.headers.get('Content-Disposition')).toContain('.csv');
+    });
+
+    it('revokes old URLs on rotation and removes revoked links without touching jobs', async () => {
+        const { config } = await fixture(), link = await createLink(config);
+        const rotated = (await api(`/parser/download-links/${link.id}/rotate`, { method: 'POST' })).data;
+        expect(rotated.path).not.toBe(link.path); expect(rotated.id).toBe(link.id);
+        expect((await publicGet(link)).status).toBe(404); expect((await publicGet(rotated)).status).toBe(200);
+        await api(`/parser/download-links/${link.id}`, { method: 'DELETE' });
+        expect((await publicGet(rotated)).status).toBe(404);
+        expect((await api(`/parser/download-links?parserId=${config.id}`)).data).toEqual([]);
+        expect((await parserService.jobs(env.db, 1, { parserId: config.id })).rows).toHaveLength(2);
+    });
+
+    it.each(['user.status=1', 'user.is_del=1', 'account.is_del=1', 'account.status=1'])('blocks anonymous downloads when %s', async mutation => {
+        const { config } = await fixture(), link = await createLink(config);
+        const [table, assignment] = mutation.split('.');
+        await env.db.prepare(`UPDATE ${table} SET ${assignment} WHERE ${table === 'user' ? 'user_id' : 'account_id'}=1`).run();
+        expect((await publicGet(link)).status).toBe(404);
+    });
+
+    it('retains links through repeated initialization and pauses, while respecting cleanup and cascades', async () => {
+        const { config } = await fixture(), link = await createLink(config);
+        await initParserSchema(env.db); await initParserSchema(env.db);
+        await parserService.saveConfig(env.db, 1, configuration({ enabled: false, retentionDays: 1, version: config.version }), config.id);
+        expect((await publicGet(link)).status).toBe(200);
+        await env.db.prepare('UPDATE parser_job SET updated_at=0').run(); await parserService.cleanup(env.db);
+        expect((await (await publicGet(link)).json()).data.rows).toEqual([]);
+        await env.db.prepare('DELETE FROM account WHERE account_id=1').run();
+        expect((await publicGet(link)).status).toBe(404);
+        expect((await env.db.prepare('SELECT COUNT(*) AS total FROM parser_download').first()).total).toBe(0);
+        expect((await env.db.prepare('PRAGMA foreign_key_check').all()).results).toEqual([]);
+    });
+
+    it.each([{ format: 'xml' }, { name: '' }, { fields: ['bad.key'] }, { fields: ['order_id', 'order_id'] },
+        { fields: 'order_id,subject,' }, { fromTime: -1 }, { fromTime: 200, toTime: 100 }, { fromTime: true },
+        { tableField: 'bad.key' }, { tableField: 'items', fields: ['order_id'] }, { size: 0 }, { size: 1.5 }, { size: true }])('rejects invalid link settings %j', async options => {
+        const config = await parserService.saveConfig(env.db, 1, configuration());
+        expect((await api('/parser/download-links', { method: 'POST', body: { parserId: config.id, name: 'x', format: 'json', ...options } })).code).toBe(400);
+    });
+
+    it('bounds link creation per rule set and frees capacity when revoked', async () => {
+        const config = await parserService.saveConfig(env.db, 1, configuration());
+        const link = await createLink(config);
+        for (let index = 0; index < 19; index++) await createLink(config);
+        expect((await api('/parser/download-links', { method: 'POST', body: { parserId: config.id, name: 'overflow', format: 'json' } })).code).toBe(409);
+        await api(`/parser/download-links/${link.id}`, { method: 'DELETE' }); await createLink(config);
+    });
+
+    it('caps JSON output at 4 MiB and permits a smaller batch without advancing shared state', async () => {
+        const { config, first, second } = await fixture();
+        const large = JSON.stringify({ data: { large: 'x'.repeat(1050000) } });
+        await env.db.batch([env.db.prepare('UPDATE parser_job SET result_json=? WHERE id=?').bind(large, first.id), env.db.prepare('UPDATE parser_job SET result_json=? WHERE id=?').bind(large, second.id)]);
+        for (let index = 0; index < 3; index++) await env.db.prepare(`INSERT INTO parser_job(parser_id,user_id,account_id,email_id,version,rules_json,input_json,status,result_json,available_at,created_at,updated_at,parsed_at)
+            VALUES(?,1,1,?,1,'[]','{}','parsed',?,0,0,0,300)`).bind(config.id, 10 + index, large).run();
+        const link = await createLink(config); expect((await publicGet(link)).status).toBe(400);
+        const smaller = await createLink(config, { size: 1 }); expect((await publicGet(smaller)).status).toBe(200);
+    });
+});
+
+describe('simple complete downloads', () => {
+    async function fixture(count = 130) {
+        const config = await parserService.saveConfig(env.db, 1, configuration());
+        await env.db.prepare(`WITH RECURSIVE sequence(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM sequence WHERE n<?)
+            INSERT INTO parser_job(parser_id,user_id,account_id,email_id,version,rules_json,input_json,status,result_json,available_at,created_at,updated_at,parsed_at)
+            SELECT ?,1,1,n+100,1,'[]','{}','parsed',json_object('data',json_object('value',n,'other','hidden')),0,0,0,1000+n FROM sequence`).bind(count, config.id).run();
+        return config;
+    }
+    const file = (config, query = '') => api(`/parser/download?parserId=${config.id}&format=json${query}`);
+    async function link(config, options = {}) {
+        const response = await api('/parser/download-links', { method: 'POST', body: { parserId: config.id, name: '常用下载', format: 'json', range: 'latest100', ...options } });
+        expect(response.code).toBe(200); return response.data;
+    }
+    const publicGet = value => api(value.path, { userId: 0, raw: true });
+
+    it('defaults to the latest 100 results, loads internal batches and returns one complete file', async () => {
+        const config = await fixture();
+        const data = (await file(config)).data;
+        expect(data.rows).toHaveLength(100); expect(data.rows[0].data.value).toBe(130); expect(data.rows.at(-1).data.value).toBe(31); expect(data.hasMore).toBe(false);
+        expect((await file(config, '&range=latest1')).data.rows.map(row => row.data.value)).toEqual([130]);
+        expect((await file(config, '&range=latest1000')).data.rows).toHaveLength(130);
+        const csv = await api(`/parser/download?parserId=${config.id}&format=csv&range=all`, { raw: true });
+        const text = await csv.text(); expect(text.split('\r\n')).toHaveLength(131); expect(text.match(/_job_id/g)).toHaveLength(1);
+        expect(csv.headers.get('X-Has-More')).toBe('false');
+    });
+
+    it('supports custom times and selected fields without exposing or requiring a cursor', async () => {
+        const config = await fixture();
+        const data = (await file(config, '&range=custom&fromTime=1100&toTime=1110&fields=value&cursor=invalid&size=1')).data;
+        expect(data.rows).toHaveLength(11); expect(data.rows[0].data).toEqual({ value: 110 }); expect(data.rows.at(-1).data).toEqual({ value: 100 });
+        expect(data.hasMore).toBe(false);
+    });
+
+    it('computes today in the configured local offset and rolling seven-day bounds', () => {
+        const now = Date.UTC(2026, 10, 12, 0, 30);
+        expect(downloadWindow(downloadOptions({ range: 'today', timezoneOffset: -480 }), now).fromTime).toBe(Date.UTC(2026, 10, 11, 16));
+        expect(downloadWindow(downloadOptions({ range: 'today', timezoneOffset: 480 }), now).fromTime).toBe(Date.UTC(2026, 10, 11, 8));
+        expect(downloadWindow(downloadOptions({ range: 'last7days' }), now)).toMatchObject({ fromTime: now - 7 * 86400000, toTime: now });
+    });
+
+    it('re-evaluates rolling ranges for each fixed-link request', async () => {
+        const config = await fixture(3), now = Date.now();
+        await env.db.prepare('UPDATE parser_job SET parsed_at=? WHERE email_id=103').bind(now - 1000).run();
+        const saved = await link(config, { range: 'last7days' });
+        expect((await (await publicGet(saved)).json()).data.rows.map(row => row.data.value)).toEqual([3]);
+        await env.db.prepare('UPDATE parser_job SET parsed_at=? WHERE email_id=102').bind(Date.now() - 500).run();
+        expect((await (await publicGet(saved)).json()).data.rows.map(row => row.data.value)).toEqual([2, 3]);
+    });
+
+    it('downloads a complete saved range and ignores public attempts to change that range', async () => {
+        const config = await fixture(), saved = await link(config, { fields: ['value'] });
+        const response = await api(`${saved.path}?range=all&fields=other&parserId=2&cursor=999999_99999&size=1`, { userId: 0, raw: true });
+        const data = (await response.json()).data;
+        expect(data.rows).toHaveLength(100); expect(data.rows[0].data).toEqual({ value: 130 }); expect(data.hasMore).toBe(false);
+        const ownerFile = await api(`/parser/download?downloadId=${saved.id}&format=csv`, { raw: true });
+        expect(ownerFile.headers.get('Content-Type')).toContain('application/json'); expect((await ownerFile.json()).data.rows).toHaveLength(100);
+    });
+
+    it('edits a saved configuration without changing its URL or permitting an ownership transfer', async () => {
+        const config = await fixture(), saved = await link(config);
+        const options = { parserId: config.id, name: '只要最新', format: 'csv', range: 'latest1', fields: ['value'] };
+        for (const userId of [0, 2]) expect((await api(`/parser/download-links/${saved.id}`, { method: 'PUT', body: options, userId })).code).toBe(userId ? 404 : 401);
+        expect((await api(`/parser/download-links/${saved.id}`, { method: 'PUT', body: { ...options, parserId: config.id + 1 } })).code).toBe(400);
+        const updated = (await api(`/parser/download-links/${saved.id}`, { method: 'PUT', body: options })).data;
+        expect(updated.path).toBe(saved.path); expect(updated.range).toBe('latest1');
+        const response = await publicGet(saved), text = await response.text();
+        expect(response.headers.get('Content-Type')).toContain('text/csv'); expect(text.split('\r\n')).toHaveLength(2); expect(text).not.toContain('other');
+        await initParserSchema(env.db);
+        expect((await api(`/parser/download-links?parserId=${config.id}`)).data[0].path).toBe(saved.path);
+    });
+
+    it('keeps hash-only old links working and makes them copyable after explicit regeneration', async () => {
+        const config = await fixture(3), saved = await link(config, { range: 'legacy', size: 1 });
+        await env.db.batch(['token_encrypted', 'range_mode', 'timezone_offset'].map(column => env.db.prepare(`ALTER TABLE parser_download DROP COLUMN ${column}`)));
+        await initParserSchema(env.db); await initParserSchema(env.db);
+        const listed = (await api(`/parser/download-links?parserId=${config.id}`)).data[0];
+        expect(listed.path).toBeNull(); expect(listed.range).toBe('legacy');
+        expect((await (await publicGet(saved)).json()).data.hasMore).toBe(true);
+        const renewed = (await api(`/parser/download-links/${saved.id}/rotate`, { method: 'POST' })).data;
+        expect((await publicGet(saved)).status).toBe(404);
+        expect((await api(`/parser/download-links?parserId=${config.id}`)).data[0].path).toBe(renewed.path);
+    });
+
+    it('does not expose unreadable encrypted tokens and supports recovery after changing the server key', async () => {
+        const config = await fixture(1), saved = await link(config);
+        expect((await parserDownloads.list(env.db, 1, config.id, 'rotated-key'))[0].path).toBeNull();
+        expect((await publicGet(saved)).status).toBe(200);
+        const renewed = await parserDownloads.rotate(env.db, 1, saved.id, 'rotated-key');
+        expect((await parserDownloads.list(env.db, 1, config.id, 'rotated-key'))[0].path).toBe(renewed.path);
+        expect((await publicGet(renewed)).status).toBe(200);
+    });
+
+    it('rejects oversized complete ranges rather than silently returning an incomplete file', async () => {
+        const config = await fixture(1001);
+        expect((await file(config, '&range=all')).code).toBe(400);
+        expect((await file(config, '&range=latest1000')).data.rows).toHaveLength(1000);
+        const large = JSON.stringify({ data: { value: 'x'.repeat(60000) } });
+        await env.db.prepare('UPDATE parser_job SET result_json=?').bind(large).run();
+        expect((await file(config)).code).toBe(400); expect((await file(config, '&range=latest1')).data.rows).toHaveLength(1);
+    });
+
+    it('combines table detail batches with one CSV header and preserves formula protection', async () => {
+        const config = await fixture(35);
+        await env.db.prepare("UPDATE parser_job SET result_json=json_object('data',json_object('items',json_array(json_object('item','=1+1'),json_object('item','中文'))))").run();
+        const response = await api(`/parser/download?parserId=${config.id}&format=csv&range=all&tableField=items`, { raw: true });
+        const text = await response.text(); expect(text.split('\r\n')).toHaveLength(71); expect(text.match(/_job_id/g)).toHaveLength(1); expect(text).toContain("'=1+1"); expect(text).toContain('中文');
+    });
+
+    it.each([{ range: 'unknown' }, { range: 'custom' }, { timezoneOffset: 9999 }, { timezoneOffset: true }, { timezoneOffset: [] }])('rejects invalid simplified settings %j', async options => {
+        const config = await fixture(1);
+        expect((await api('/parser/download-links', { method: 'POST', body: { parserId: config.id, name: 'test', format: 'json', range: 'latest100', ...options } })).code).toBe(400);
+    });
+
+    it('keeps complete downloads behind session and rule-set ownership checks', async () => {
+        const config = await fixture(1), saved = await link(config);
+        for (const path of [`/parser/download?parserId=${config.id}&format=json`, `/parser/download?downloadId=${saved.id}`]) {
+            expect((await api(path, { userId: 0 })).code).toBe(401); expect((await api(path, { userId: 2 })).code).toBe(404);
+        }
     });
 });
 

@@ -120,19 +120,9 @@
         </el-tab-pane>
         <el-tab-pane :label="t('parser.results')" name="results">
           <div class="results-toolbar">
-            <label for="parser-export-field">{{ t('parser.exportTable') }}</label>
-            <el-select id="parser-export-field" v-model="exportTableField" :empty-values="[null, undefined]" :disabled="busy.exporting" :aria-label="t('parser.exportTable')" style="width: 200px">
-              <el-option value="" :label="t('parser.exportPerEmail')" />
-              <el-option v-for="field in exportTables" :key="field.key" :value="field.key" :label="field.key" />
-            </el-select>
-            <label for="parser-export-size">{{ t('parser.exportSize') }}</label>
-            <el-input-number id="parser-export-size" v-model="exportBatchSize" :disabled="busy.exporting" :min="1" :max="exportTableField ? 10 : 100" :precision="0" />
             <el-button :disabled="!draft.id" :loading="busy.jobs" @click="loadJobs">{{ t('parser.refresh') }}</el-button>
-            <el-button v-for="format in ['csv', 'json']" :key="format" :disabled="!draft.id" :loading="busy.exporting" @click="download(format)">
-              {{ exportMore[format] ? t('parser.exportNext', { format: format.toUpperCase() }) : t(format === 'csv' ? 'parser.exportCsv' : 'parser.exportJson') }}
-            </el-button>
+            <el-button :disabled="!draft.id" @click="activeTab = 'downloads'">{{ t('parser.downloadResults') }}</el-button>
           </div>
-          <p class="help">{{ t('parser.exportHelp') }}</p>
           <el-table v-loading="busy.jobs" :data="jobs" :empty-text="t('parser.noJobs')" row-key="id" style="width: 100%">
             <el-table-column prop="id" :label="t('parser.id')" width="75" />
             <el-table-column prop="emailId" :label="t('parser.emailId')" width="100" />
@@ -147,6 +137,10 @@
             <el-button :disabled="!hasMore || busy.jobs" @click="nextPage">{{ t('parser.next') }}</el-button>
             <el-button v-if="cursorStack.length" :disabled="busy.jobs" @click="firstPage">{{ t('parser.backToFirst') }}</el-button>
           </div>
+        </el-tab-pane>
+        <el-tab-pane :label="t('parser.downloads')" name="downloads">
+          <download-panel v-if="draft.id" :key="draft.id" :parser-id="draft.id" :rules="savedRules" @busy="busy.downloadLinks = $event" />
+          <p v-else class="help">{{ t('parser.downloadSaveFirst') }}</p>
         </el-tab-pane>
       </el-tabs>
     </template>
@@ -190,24 +184,22 @@ import { useAccountStore } from '@/store/account.js';
 import RuleEditor from './rule-editor.vue';
 import ConditionEditor from './condition-editor.vue';
 import TableResults from './table-results.vue';
-import { parserAccounts, parserConfigs, parserSave, parserSamples, parserPreview, parserEnqueue, parserJobs, parserJob, parserRetry, parserDownload } from '@/request/parser.js';
+import DownloadPanel from './download-panel.vue';
+import { parserAccounts, parserConfigs, parserSave, parserSamples, parserPreview, parserEnqueue, parserJobs, parserJob, parserRetry } from '@/request/parser.js';
 
 const { t } = useI18n();
 const accounts = ref([]), configs = ref([]), selectedAccount = ref(0), selectedSample = ref(0), samples = ref([]);
 const activeTab = ref('configuration'), draft = ref({ rules: [], conditions: [] }), baseline = ref(''), preview = ref(null), error = ref('');
-const busy = reactive({ loading: false, saving: false, previewing: false, submitting: false, jobs: false, exporting: false, retrying: false });
+const busy = reactive({ loading: false, saving: false, previewing: false, submitting: false, jobs: false, retrying: false });
 const jobs = ref([]), cursor = ref(0), nextCursor = ref(0), cursorStack = ref([]), hasMore = ref(false);
 const drawerOpen = ref(false), detail = ref(null);
-const exportCursor = reactive({ csv: '0_0', json: '0_0' }), exportMore = reactive({ csv: false, json: false });
 const sampleInput = reactive({ subject: 'Order A-100', text: t('parser.sampleOrder'), html: '', from: '', to: '' });
 const sampleCsv = reactive({ name: 'orders.csv', text: 'item,quantity\nWidget,2\nCable,3' });
 const hasCsvRule = computed(() => draft.value.rules.some(rule => rule.source === 'csvAttachment'));
 const attachmentNames = computed(() => selectedSample.value ? samples.value.find(sample => sample.emailId === selectedSample.value)?.attachmentNames || [] : [sampleCsv.name].filter(Boolean));
-const exportTableField = ref('');
-const exportBatchSize = ref(100);
-const exportTables = computed(() => configs.value.find(config => config.id === draft.value.id)?.rules.filter(rule => ['htmlTable', 'csvAttachment'].includes(rule.source)) || []);
 const dirty = computed(() => baseline.value && JSON.stringify(draft.value) !== baseline.value);
-const changingRuleBlocked = computed(() => busy.loading || busy.saving || busy.exporting || busy.submitting || busy.retrying || busy.detail);
+const savedRules = computed(() => configs.value.find(config => config.id === draft.value.id)?.rules || []);
+const changingRuleBlocked = computed(() => busy.loading || busy.saving || busy.submitting || busy.retrying || busy.detail || busy.downloadLinks);
 let jobRequest = 0;
 let jobContext = '';
 let poll;
@@ -226,7 +218,6 @@ async function confirmDiscard() {
   try { await ElMessageBox.confirm(t('parser.leave'), t('parser.unsaved'), { confirmButtonText: t('parser.confirm'), cancelButtonText: t('parser.cancel'), type: 'warning' }); return true; }
   catch { return false; }
 }
-function resetExports() { for (const format of ['csv', 'json']) { exportCursor[format] = '0_0'; exportMore[format] = false; } }
 async function selectRuleSet(saved) {
   draft.value = saved ? { ...JSON.parse(JSON.stringify(saved)), webhookSecret: '', clearWebhookSecret: false } : {
     accountId: selectedAccount.value, name: `${t('parser.defaultName')}${configs.value.length ? ` ${configs.value.length + 1}` : ''}`, enabled: false, retentionDays: 30, conditions: [], webhookUrl: '', webhookSecret: '', clearWebhookSecret: false,
@@ -235,7 +226,6 @@ async function selectRuleSet(saved) {
   baseline.value = JSON.stringify(draft.value);
   preview.value = null; jobs.value = []; cursor.value = 0; cursorStack.value = []; hasMore.value = false;
   detail.value = null; drawerOpen.value = false; jobRequest++; busy.jobs = false;
-  exportTableField.value = ''; resetExports();
   if (draft.value.id) await loadJobs();
   else activeTab.value = 'configuration';
 }
@@ -270,7 +260,6 @@ async function save() {
     configs.value = [saved, ...configs.value.filter(config => config.id !== saved.id)].sort((a, b) => b.id - a.id);
     draft.value = { ...saved, webhookSecret: '', clearWebhookSecret: false };
     baseline.value = JSON.stringify(draft.value);
-    resetExports();
     ElMessage.success(t('parser.saved'));
   });
 }
@@ -322,22 +311,8 @@ async function retry(kind) {
     ElMessage.success(t('parser.retried'));
   });
 }
-async function download(format) {
-  await run('exporting', async () => {
-    const data = await parserDownload(draft.value.id, format, exportCursor[format], format === 'csv' ? exportTableField.value : '', exportBatchSize.value);
-    const url = URL.createObjectURL(data.blob);
-    const link = document.createElement('a');
-    link.href = url; link.download = `parsed-emails-${draft.value.id}-${Date.now()}.${format}`;
-    document.body.appendChild(link); link.click(); link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    exportCursor[format] = data.hasMore ? data.nextCursor : '0_0';
-    exportMore[format] = data.hasMore;
-  });
-}
 watch(activeTab, tab => { if (tab === 'results') loadJobs(); });
 watch([() => draft.value.rules, () => draft.value.conditions, selectedSample, sampleInput, sampleCsv], () => { preview.value = null; }, { deep: true });
-watch(exportTableField, value => { exportBatchSize.value = Math.min(exportBatchSize.value || 100, value ? 10 : 100); exportCursor.csv = '0_0'; exportMore.csv = false; });
-watch(exportTables, tables => { if (!tables.some(field => field.key === exportTableField.value)) exportTableField.value = ''; });
 onBeforeRouteLeave(confirmDiscard);
 onMounted(() => {
   reload();

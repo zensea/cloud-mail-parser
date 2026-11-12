@@ -92,6 +92,9 @@ const premKey = {
 app.use('*', async (c, next) => {
 
 	const path = c.req.path;
+	// Only this GET endpoint uses its own per-download bearer token. Management
+	// routes under /parser still require the existing JWT and session checks.
+	if (c.req.method === 'GET' && /^\/parser-download\/[^/]+$/.test(path)) return await next();
 
 	const index = exclude.findIndex(item => {
 		return path.startsWith(item);

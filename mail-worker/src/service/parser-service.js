@@ -3,6 +3,7 @@ import { validateRules, parseEmail, emailInput, checkSize } from '../lib/parser-
 import { readEmailInput } from './parser-input';
 import { validateConditions, matchEmail } from '../lib/parser-matcher';
 import { emailConst } from '../const/entity-const';
+import { exportOptions, downloadOptions, downloadWindow } from '../lib/parser-export';
 
 const LEASE_MS = 60000;
 const MAX_PARSE_ATTEMPTS = 3;
@@ -44,7 +45,7 @@ function jobView(row, detail = false) {
         ...(detail ? { rules: JSON.parse(row.rules_json), webhookUrl: row.webhook_url } : {}) };
 }
 
-async function ownConfig(db, id, userId) {
+export async function ownConfig(db, id, userId) {
     const row = await db.prepare(`SELECT ${configFields} FROM parser_config WHERE id = ? AND user_id = ?`).bind(positiveId(id), userId).first();
     if (!row) throw new BizError('Parser configuration not found', 404);
     return row;
@@ -234,16 +235,50 @@ const parserService = {
         if (!/^\d{1,16}_\d{1,16}$/.test(cursor)) throw new BizError('Invalid export cursor', 400);
         const [time, id] = cursor.split('_').map(Number);
         if (!Number.isSafeInteger(time) || !Number.isSafeInteger(id)) throw new BizError('Invalid export cursor', 400);
-        const tableField = params.tableField || '';
-        if (tableField && !/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(tableField)) throw new BizError('Invalid table export field', 400);
-        const size = params.size === undefined ? (tableField ? 10 : 100) : Math.min(tableField ? 10 : 100, positiveId(params.size));
+        const { tableField, fields, fromTime, toTime, size } = exportOptions(params);
         const { results } = await db.prepare(`SELECT * FROM parser_job WHERE user_id=? AND parser_id=? AND status='parsed'
             AND (?='' OR json_type(result_json,?)='array')
-            AND (parsed_at>? OR (parsed_at=? AND id>?)) ORDER BY parsed_at,id LIMIT ?`).bind(userId, parserId, tableField, `$.data.${tableField}`, time, time, id, size + 1).all();
+            AND parsed_at>=? AND (?=0 OR parsed_at<=?)
+            AND (parsed_at>? OR (parsed_at=? AND id>?)) ORDER BY parsed_at,id LIMIT ?`).bind(userId, parserId, tableField, `$.data.${tableField}`, fromTime, toTime, toTime, time, time, id, size + 1).all();
         const rows = results.slice(0, size);
         const last = rows.at(-1);
-        return { rows: rows.map(row => ({ id: row.id, emailId: row.email_id, version: row.version, parsedAt: row.parsed_at, data: JSON.parse(row.result_json).data })),
+        return { rows: rows.map(row => {
+            const data = JSON.parse(row.result_json).data;
+            return { id: row.id, emailId: row.email_id, version: row.version, parsedAt: row.parsed_at,
+                data: fields.length ? Object.fromEntries(fields.filter(key => Object.hasOwn(data, key)).map(key => [key, data[key]])) : data };
+        }),
             hasMore: results.length > size, nextCursor: last ? `${last.parsed_at}_${last.id}` : cursor };
+    },
+
+    async downloadRows(db, userId, params) {
+        const config = await ownConfig(db, params.parserId, userId);
+        const options = downloadOptions(params);
+        const { fromTime, toTime, limit, limited } = downloadWindow(options);
+        const rows = [], encoder = new TextEncoder();
+        let beforeTime = toTime, beforeId = Number.MAX_SAFE_INTEGER, bytes = 0;
+        // Bound each query and the assembled file. No partially downloaded file
+        // or per-link cursor is committed when a range exceeds either limit.
+        while (true) {
+            const size = Math.min(options.tableField ? 10 : 25, limit - rows.length + (limited ? 0 : 1));
+            if (!size) break;
+            const { results } = await db.prepare(`SELECT id,email_id,version,parsed_at,result_json FROM parser_job
+                WHERE user_id=? AND parser_id=? AND status='parsed' AND parsed_at>=?
+                AND (parsed_at<? OR (parsed_at=? AND id<?))
+                AND (?='' OR json_type(result_json,?)='array') ORDER BY parsed_at DESC,id DESC LIMIT ?`)
+                .bind(userId, config.id, fromTime, beforeTime, beforeTime, beforeId, options.tableField, `$.data.${options.tableField}`, size).all();
+            for (const result of results) {
+                if (rows.length >= limit) throw new BizError('Download exceeds 1000 results; choose a narrower range', 400);
+                const data = JSON.parse(result.result_json).data;
+                const row = { id: result.id, emailId: result.email_id, version: result.version, parsedAt: result.parsed_at,
+                    data: options.fields.length ? Object.fromEntries(options.fields.filter(key => Object.hasOwn(data, key)).map(key => [key, data[key]])) : data };
+                bytes += encoder.encode(JSON.stringify(row)).byteLength;
+                if (bytes > 4194304) throw new BizError('Download exceeds 4 MiB; choose fewer results or fields', 400);
+                rows.push(row);
+            }
+            if (results.length < size) break;
+            const last = results.at(-1); beforeTime = last.parsed_at; beforeId = last.id;
+        }
+        return { rows, hasMore: false, nextCursor: '0_0' };
     },
 
     async cleanup(db) {

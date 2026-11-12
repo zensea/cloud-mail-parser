@@ -57,8 +57,29 @@ export async function initParserSchema(db) {
         await db.batch(multiParserMigrationSql(tableColumns).map(sql => db.prepare(sql)));
         break;
     }
-    await db.batch(parserSchema.filter(sql => sql.startsWith('CREATE INDEX')).map(sql => db.prepare(sql)));
+    await db.batch([...parserSchema.filter(sql => sql.startsWith('CREATE INDEX')), ...downloadSchema].map(sql => db.prepare(sql)));
+    const downloadColumns = (await db.prepare('PRAGMA table_info(parser_download)').all()).results;
+    for (const [name, definition] of Object.entries({ range_mode: "TEXT NOT NULL DEFAULT 'legacy'", timezone_offset: 'INTEGER NOT NULL DEFAULT 0', token_encrypted: "TEXT NOT NULL DEFAULT ''" })) {
+        if (!downloadColumns.some(column => column.name === name)) await db.prepare(`ALTER TABLE parser_download ADD COLUMN ${name} ${definition}`).run();
+    }
 }
+
+// Create after the legacy parent-table rebuild, so existing downloads are never
+// included in the single-rule migration's drop/recreate sequence.
+const downloadSchema = [
+    `CREATE TABLE IF NOT EXISTS parser_download (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        parser_id INTEGER NOT NULL REFERENCES parser_config(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL, name TEXT NOT NULL, format TEXT NOT NULL,
+        fields_json TEXT NOT NULL DEFAULT '[]', table_field TEXT NOT NULL DEFAULT '',
+        from_time INTEGER NOT NULL DEFAULT 0, to_time INTEGER NOT NULL DEFAULT 0,
+        batch_size INTEGER NOT NULL DEFAULT 100, token_hash TEXT NOT NULL UNIQUE,
+        range_mode TEXT NOT NULL DEFAULT 'legacy', timezone_offset INTEGER NOT NULL DEFAULT 0,
+        token_encrypted TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+    )`,
+    'CREATE INDEX IF NOT EXISTS idx_parser_download_owner ON parser_download(user_id,parser_id,id)'
+];
 
 const quote = name => `"${name.replaceAll('"', '""')}"`;
 

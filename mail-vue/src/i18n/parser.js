@@ -1,4 +1,15 @@
 export const parserZh = {
+    downloads: '下载', manualDownload: '手动下载', fixedDownloadLinks: '固定下载链接', downloadSaveFirst: '请先保存规则集，再下载结果或创建链接。',
+    downloadScopeHelp: '默认下载最近 100 条成功结果和全部字段。时间范围按解析完成时间计算。',
+    downloadNow: '下载', downloadResults: '下载结果', downloadRange: '结果范围',
+    downloadRanges: { latest1: '最近 1 条结果', latest100: '最近 100 条结果', latest1000: '最近 1000 条结果', today: '今天', last7days: '近 7 天', all: '全部已保留结果', custom: '自定义时间', legacy: '原有范围' },
+    downloadAdvanced: '高级设置', downloadAdvancedSet: '高级设置（已设置）', downloadSelectedFields: '指定字段', downloadChooseFields: '请至少选择一个字段，或改为全部字段。',
+    editDownloadLink: '编辑', saveDownloadLink: '保存', downloadLinkUpdated: '链接已重新生成', downloadRecoverLink: '此链接需要重新生成才能再次复制，原链接届时将失效。继续？',
+    downloadFields: '下载字段', downloadAllFields: '全部字段', downloadTimeRange: '解析完成时间范围', downloadFrom: '开始时间', downloadTo: '结束时间',
+    downloadName: '链接名称', downloadFormat: '文件格式', createDownloadLink: '创建固定链接', noDownloadLinks: '此规则集尚未创建下载链接。', downloadBatch: '每批 {count} 封邮件',
+    downloadLinkHelp: '保存常用下载设置，随时下载或复制链接。任何持有链接者均可免登录访问；每套最多 20 个链接。',
+    downloadUrl: '下载链接', copyDownloadLink: '复制链接', openDownloadLink: '打开下载', downloadCopied: '链接已复制', downloadCopyManually: '请选中链接并手动复制。',
+    rotateDownloadLink: '重新生成链接', revokeDownloadLink: '撤销链接', rotateDownloadConfirm: '重新生成后旧链接将失效，继续？', revokeDownloadConfirm: '撤销后此链接将无法下载，继续？',
     title: '邮件解析', description: '从业务邮件提取字段，自动整理并发送结果。', configuration: '解析配置', results: '处理结果',
     mailbox: '选择邮箱', name: '规则集名称', enabled: '启用此规则集', enabledHelp: '自动处理此规则集建立后收到的邮件；历史邮件可手动提交。暂停后，仅此规则集的待处理任务暂停。',
     ruleSet: '选择规则集', newRuleSet: '未保存的新规则集', addRuleSet: '新增规则集', ruleSetHelp: '同一邮箱可配置多套独立规则。邮件会分别匹配，所有符合条件的规则集都会执行；各套的结果、推送、版本和重试相互独立。',
@@ -33,6 +44,17 @@ export const parserZh = {
 };
 
 export const parserEn = {
+    downloads: 'Downloads', manualDownload: 'Manual download', fixedDownloadLinks: 'Permanent download links', downloadSaveFirst: 'Save the rule set before downloading results or creating links.',
+    downloadScopeHelp: 'Downloads the latest 100 successful results and all fields by default. Time ranges use parsing completion times.',
+    downloadNow: 'Download', downloadResults: 'Download results', downloadRange: 'Result range',
+    downloadRanges: { latest1: 'Latest result', latest100: 'Latest 100 results', latest1000: 'Latest 1000 results', today: 'Today', last7days: 'Last 7 days', all: 'All retained results', custom: 'Custom dates', legacy: 'Original range' },
+    downloadAdvanced: 'Advanced settings', downloadAdvancedSet: 'Advanced settings (configured)', downloadSelectedFields: 'Selected fields', downloadChooseFields: 'Select at least one field, or choose all fields.',
+    editDownloadLink: 'Edit', saveDownloadLink: 'Save', downloadLinkUpdated: 'Link regenerated', downloadRecoverLink: 'Regenerate this link to make it available for copying again? The old link will stop working.',
+    downloadFields: 'Download fields', downloadAllFields: 'All fields', downloadTimeRange: 'Parsing completion range', downloadFrom: 'Start time', downloadTo: 'End time',
+    downloadName: 'Link name', downloadFormat: 'File format', createDownloadLink: 'Create download link', noDownloadLinks: 'No download links for this rule set yet.', downloadBatch: '{count} emails per batch',
+    downloadLinkHelp: 'Save a download configuration to download or copy its link anytime. Anyone with the link can access it without signing in. Up to 20 links per rule set.',
+    downloadUrl: 'Download URL', copyDownloadLink: 'Copy link', openDownloadLink: 'Open download', downloadCopied: 'Link copied', downloadCopyManually: 'Select and copy the link manually.',
+    rotateDownloadLink: 'Regenerate link', revokeDownloadLink: 'Revoke link', rotateDownloadConfirm: 'The old link will stop working. Regenerate it?', revokeDownloadConfirm: 'This link will stop working. Revoke it?',
     title: 'Email parsing', description: 'Extract business data from emails and send structured results.', configuration: 'Configuration', results: 'Results',
     mailbox: 'Mailbox', name: 'Rule set name', enabled: 'Enable this rule set', enabledHelp: 'Processes mail received after this rule set was created. Submit older mail manually. Pausing affects only this rule set and its pending work.',
     ruleSet: 'Rule set', newRuleSet: 'Unsaved new rule set', addRuleSet: 'Add rule set', ruleSetHelp: 'Each mailbox can have multiple independent rule sets. Every matching set runs with its own results, delivery, versions and retries.',
