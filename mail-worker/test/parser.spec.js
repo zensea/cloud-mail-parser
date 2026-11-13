@@ -7,6 +7,7 @@ import jwtUtils from '../src/utils/jwt-utils';
 import { email as receiveEmail } from '../src/email/email';
 import { downloadOptions, downloadWindow } from '../src/lib/parser-export';
 import parserDownloads from '../src/service/parser-download-service';
+import constant from '../src/const/constant';
 
 const rules = [{ key: 'order_id', source: 'text', required: true,
     filters: [{ type: 'regex', pattern: '订单号: ([A-Z0-9-]+)', group: 1 }] }];
@@ -24,12 +25,12 @@ beforeEach(async () => {
     await initParserSchema(env.db);
 });
 
-async function api(path, { method = 'GET', body, userId = 1, raw = false } = {}) {
+async function api(path, { method = 'GET', body, userId = 1, raw = false, gen = constant.AUTH_GEN } = {}) {
     const ctx = createExecutionContext();
     const headers = { 'Content-Type': 'application/json' };
     if (userId) {
         const token = `test-session-${userId}`;
-        headers.Authorization = await jwtUtils.generateToken({ env }, { userId, token }, 3600);
+        headers.Authorization = await jwtUtils.generateToken({ env }, { userId, token, gen: gen ?? undefined }, 3600);
         await env.kv.put(`auth-uid:${userId}`, JSON.stringify({ tokens: [token], user: { userId, email: `${userId}@example.test` }, refreshTime: new Date().toISOString() }));
     }
     const response = await worker.fetch(new Request(`https://local.test/api${path}`, { method, headers, ...(body ? { body: JSON.stringify(body) } : {}) }), env, ctx);
@@ -45,6 +46,10 @@ describe('parser on local Workers D1 and existing authentication', () => {
 
     it('requires a valid authenticated session', async () => {
         expect((await api('/parser/configs', { userId: 0 })).code).toBe(401);
+    });
+
+    it.each([null, constant.AUTH_GEN - 1])('rejects a login token with obsolete generation %s', async gen => {
+        expect((await api('/parser/configs', { gen })).code).toBe(401);
     });
 
     it('isolates configuration, samples, preview, jobs, retries and exports between users', async () => {
