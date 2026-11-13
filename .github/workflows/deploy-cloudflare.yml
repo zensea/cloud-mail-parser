@@ -8,6 +8,7 @@ on:
     paths:
       - "mail-worker/**"
       - "mail-vue/**"
+      # 工作流自身的变更也触发部署，便于验证部署配置。
       - ".github/workflows/deploy-cloudflare.yml"
   workflow_dispatch:
 
