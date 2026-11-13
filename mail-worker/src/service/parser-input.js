@@ -10,11 +10,11 @@ function decode(bytes) {
     catch { throw new Error('CSV attachments must use UTF-8 encoding'); }
 }
 
-async function storedCsv(env, file) {
+async function storedCsv(c, file) {
     if (file.size > CSV_BYTES) throw new Error('CSV attachment exceeds 64 KiB');
     let reader;
     try {
-        const object = await r2Service.getObj({ env }, file.key);
+        const object = await r2Service.getObj(c, file.key);
         if (!object || object.ok === false || !object.body) throw new Error('Unavailable');
         reader = object.body.getReader();
         const chunks = [];
@@ -40,7 +40,8 @@ async function storedCsv(env, file) {
 }
 
 // Storage keys come exclusively from owned email metadata, never from request input.
-export async function readEmailInput(db, row, rules, { env, attachments } = {}) {
+export async function readEmailInput(c, row, rules, { attachments } = {}) {
+    const db = c.env.db;
     const names = [...new Set(validateRules(rules).filter(rule => rule.source === 'csvAttachment').map(rule => rule.options.attachmentName))];
     if (names.length > 5) throw new Error('Use at most 5 CSV attachments per email');
     const files = [];
@@ -53,7 +54,7 @@ export async function readEmailInput(db, row, rules, { env, attachments } = {}) 
             if (matches.length > 1) throw new Error('CSV attachment name is ambiguous');
             if (!matches.length) continue; // Required fields report missing files through normal validation.
             const file = matches[0];
-            files.push({ name, text: attachments ? decode(file.content) : await storedCsv(env, file) });
+            files.push({ name, text: attachments ? decode(file.content) : await storedCsv(c, file) });
         }
     }
     return emailInput({ subject: row.subject, text: row.text, content: row.content,

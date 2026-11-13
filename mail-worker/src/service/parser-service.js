@@ -45,7 +45,8 @@ function jobView(row, detail = false) {
         ...(detail ? { rules: JSON.parse(row.rules_json), webhookUrl: row.webhook_url } : {}) };
 }
 
-export async function ownConfig(db, id, userId) {
+export async function ownConfig(c, id, userId) {
+    const db = c.env.db;
     const row = await db.prepare(`SELECT ${configFields} FROM parser_config WHERE id = ? AND user_id = ?`).bind(positiveId(id), userId).first();
     if (!row) throw new BizError('Parser configuration not found', 404);
     return row;
@@ -64,7 +65,8 @@ async function ownEmail(db, emailId, userId, accountId) {
     return row;
 }
 
-async function addJob(db, config, email, options) {
+async function addJob(c, config, email, options) {
+    const db = c.env.db;
     const emailId = email.email_id ?? email.emailId;
     const existing = await db.prepare('SELECT * FROM parser_job WHERE parser_id=? AND email_id=? AND version=?')
         .bind(config.id, emailId, config.version).first();
@@ -75,7 +77,7 @@ async function addJob(db, config, email, options) {
     try {
         const match = matchEmail(JSON.parse(config.conditions_json), email);
         if (!match.matched) return { job: null, match };
-        input = JSON.stringify(await readEmailInput(db, email, JSON.parse(config.rules_json), options));
+        input = JSON.stringify(await readEmailInput(c, email, JSON.parse(config.rules_json), options));
     }
     catch (reason) { if (reason.code === 503) throw reason; error = reason.message; }
     await db.prepare(`INSERT OR IGNORE INTO parser_job
@@ -88,20 +90,24 @@ async function addJob(db, config, email, options) {
     return { job };
 }
 
+// Match existing services: HTTP callers pass c; Worker events pass { env }.
 const parserService = {
-    async accounts(db, userId) {
+    async accounts(c, userId) {
+        const db = c.env.db;
         const { results } = await db.prepare('SELECT account_id AS accountId, email, name FROM account WHERE user_id = ? AND is_del = 0 ORDER BY account_id DESC LIMIT 500').bind(userId).all();
         return results;
     },
 
-    async configs(db, userId, accountId) {
+    async configs(c, userId, accountId) {
+        const db = c.env.db;
         const mailbox = accountId === undefined ? 0 : positiveId(accountId);
         if (mailbox) await ownAccount(db, mailbox, userId);
         const { results } = await db.prepare(`SELECT ${configFields} FROM parser_config WHERE user_id = ? AND (?=0 OR account_id=?) ORDER BY id DESC`).bind(userId, mailbox, mailbox).all();
         return results.map(configView);
     },
 
-    async saveConfig(db, userId, params, id) {
+    async saveConfig(c, userId, params, id) {
+        const db = c.env.db;
         if (!params || typeof params !== 'object') throw new BizError('Invalid configuration', 400);
         const accountId = positiveId(params.accountId);
         await ownAccount(db, accountId, userId);
@@ -121,7 +127,7 @@ const parserService = {
         }
         const now = Date.now();
         if (id) {
-            const old = await ownConfig(db, id, userId);
+            const old = await ownConfig(c, id, userId);
             if (old.account_id !== accountId) throw new BizError('The mailbox of an existing parser cannot be changed', 400);
             if (params.version !== old.version) throw new BizError('Configuration changed. Reload before saving.', 409);
             const secret = params.clearWebhookSecret ? '' : params.webhookSecret || old.webhook_secret;
@@ -137,7 +143,8 @@ const parserService = {
         return configView(row);
     },
 
-    async samples(db, userId, accountId) {
+    async samples(c, userId, accountId) {
+        const db = c.env.db;
         await ownAccount(db, accountId, userId);
         const { results } = await db.prepare(`SELECT email_id AS emailId, subject, create_time AS createTime FROM email
             WHERE user_id=? AND account_id=? AND type=0 AND status=0 AND is_del=0 ORDER BY email_id DESC LIMIT 30`).bind(userId, Number(accountId)).all();
@@ -147,51 +154,56 @@ const parserService = {
         return results.map(row => ({ ...row, attachmentNames: files.filter(file => file.email_id === row.emailId && file.filename?.toLowerCase().endsWith('.csv')).map(file => file.filename) }));
     },
 
-    async preview(db, userId, params, options) {
+    async preview(c, userId, params, options) {
+        const db = c.env.db;
         await ownAccount(db, params.accountId, userId);
         const row = params.emailId ? await ownEmail(db, params.emailId, userId, Number(params.accountId)) : null;
         try {
             const rules = validateRules(params.rules);
             const match = matchEmail(params.conditions, row || params.sample || {}, true);
             if (!match.matched) return { match, data: {}, errors: [], fields: [] };
-            const input = row ? await readEmailInput(db, row, rules, options) : emailInput(params.sample || {});
+            const input = row ? await readEmailInput(c, row, rules, options) : emailInput(params.sample || {});
             return { ...parseEmail(rules, input, true), match };
         } catch (error) { throw new BizError(error.message, error.code === 503 ? 503 : 400); }
     },
 
-    async enqueue(db, userId, parserId, emailId, options) {
-        const config = await ownConfig(db, parserId, userId);
+    async enqueue(c, userId, parserId, emailId, options) {
+        const db = c.env.db;
+        const config = await ownConfig(c, parserId, userId);
         await ownAccount(db, config.account_id, userId);
         if (!config.enabled) throw new BizError('Enable this parser before processing emails', 409);
-        const { job: row, match } = await addJob(db, config, await ownEmail(db, emailId, userId, config.account_id), options);
+        const { job: row, match } = await addJob(c, config, await ownEmail(db, emailId, userId, config.account_id), options);
         if (match && !match.matched) return { matched: false, checks: match.checks };
         if (!row) throw new BizError('Configuration changed. Reload before processing.', 409);
         if (row.status === 'expired') throw new BizError('This result has expired; save a new rule version before resubmitting', 410);
         return jobView(row);
     },
 
-    async receive(db, email, options) {
+    async receive(c, email, options) {
+        const db = c.env.db;
         if (!email.userId || !email.accountId) return;
         const { results: configs } = await db.prepare('SELECT * FROM parser_config WHERE user_id=? AND account_id=? AND enabled=1 ORDER BY id').bind(email.userId, email.accountId).all();
-        const results = await runConfigs(configs, async config => !!(await addJob(db, config, email, options)).job);
+        const results = await runConfigs(configs, async config => !!(await addJob(c, config, email, options)).job);
         return results.some(Boolean);
     },
 
-    async reconcile(db, options) {
-        await runConfigs(await scanConfigs(db), config => reconcileConfig(db, config, options));
+    async reconcile(c, options) {
+        await runConfigs(await scanConfigs(c.env.db), config => reconcileConfig(c, config, options));
     },
 
-    async tick(db, options = {}) {
+    async tick(c, options = {}) {
+        const db = c.env.db;
         await recoverLeases(db);
         await runConfigs(await scanConfigs(db), async config => {
-            await reconcileConfig(db, config, options);
+            await reconcileConfig(c, config, options);
             await processConfig(db, config.id, options);
         });
     },
 
-    async jobs(db, userId, params) {
+    async jobs(c, userId, params) {
+        const db = c.env.db;
         const parserId = positiveId(params.parserId);
-        await ownConfig(db, parserId, userId);
+        await ownConfig(c, parserId, userId);
         const cursor = Number(params.cursor || 0);
         if (!Number.isSafeInteger(cursor) || cursor < 0) throw new BizError('Invalid cursor', 400);
         const size = params.size ? Math.min(50, positiveId(params.size)) : 20;
@@ -201,17 +213,19 @@ const parserService = {
         return { rows: rows.map(row => jobView(row)), hasMore: results.length > size, nextCursor: rows.at(-1)?.id || 0 };
     },
 
-    async job(db, userId, id) {
+    async job(c, userId, id) {
+        const db = c.env.db;
         const row = await db.prepare('SELECT * FROM parser_job WHERE id=? AND user_id=?').bind(positiveId(id), userId).first();
         if (!row) throw new BizError('Parser job not found', 404);
         const { results } = await db.prepare('SELECT attempt,status_code AS statusCode,error,created_at AS createdAt FROM parser_delivery WHERE job_id=? AND user_id=? ORDER BY id DESC LIMIT 50').bind(row.id, userId).all();
         return { ...jobView(row, true), deliveries: results };
     },
 
-    async retry(db, userId, id, kind) {
+    async retry(c, userId, id, kind) {
+        const db = c.env.db;
         const row = await db.prepare('SELECT * FROM parser_job WHERE id=? AND user_id=?').bind(positiveId(id), userId).first();
         if (!row) throw new BizError('Parser job not found', 404);
-        const config = await ownConfig(db, row.parser_id, userId);
+        const config = await ownConfig(c, row.parser_id, userId);
         await ownAccount(db, row.account_id, userId);
         if (!config.enabled) throw new BizError('Enable this parser before retrying', 409);
         const now = Date.now();
@@ -228,9 +242,10 @@ const parserService = {
         return { parserId: row.parser_id };
     },
 
-    async exportRows(db, userId, params) {
+    async exportRows(c, userId, params) {
+        const db = c.env.db;
         const parserId = positiveId(params.parserId);
-        await ownConfig(db, parserId, userId);
+        await ownConfig(c, parserId, userId);
         const cursor = String(params.cursor || '0_0');
         if (!/^\d{1,16}_\d{1,16}$/.test(cursor)) throw new BizError('Invalid export cursor', 400);
         const [time, id] = cursor.split('_').map(Number);
@@ -250,8 +265,9 @@ const parserService = {
             hasMore: results.length > size, nextCursor: last ? `${last.parsed_at}_${last.id}` : cursor };
     },
 
-    async downloadRows(db, userId, params) {
-        const config = await ownConfig(db, params.parserId, userId);
+    async downloadRows(c, userId, params) {
+        const db = c.env.db;
+        const config = await ownConfig(c, params.parserId, userId);
         const options = downloadOptions(params);
         const { fromTime, toTime, limit, limited } = downloadWindow(options);
         const rows = [], encoder = new TextEncoder();
@@ -281,7 +297,8 @@ const parserService = {
         return { rows, hasMore: false, nextCursor: '0_0' };
     },
 
-    async cleanup(db) {
+    async cleanup(c) {
+        const db = c.env.db;
         // Keep identifiers for deduplication: deleting rows would resend old mail on reconciliation.
         const { results } = await db.prepare(`SELECT j.id FROM parser_job j JOIN parser_config c ON c.id=j.parser_id
             WHERE c.retention_days>0 AND j.updated_at < ?-c.retention_days*86400000
@@ -304,7 +321,8 @@ const parserService = {
         return batch[1].meta.changes;
     },
 
-    async process(db, { userId = 0, parserId = 0, fetcher = fetch } = {}) {
+    async process(c, { userId = 0, parserId = 0, fetcher = fetch } = {}) {
+        const db = c.env.db;
         await recoverLeases(db, { userId, parserId });
         const { results: configs } = await db.prepare(`SELECT c.id FROM parser_config c
             JOIN account a ON a.account_id=c.account_id AND a.user_id=c.user_id AND a.is_del=0
@@ -403,7 +421,8 @@ async function scanConfigs(db) {
         WHERE c.enabled=1 ORDER BY c.last_scanned_at,c.id LIMIT 10`).all()).results;
 }
 
-async function reconcileConfig(db, config, options) {
+async function reconcileConfig(c, config, options) {
+    const db = c.env.db;
     const { results: emails } = await db.prepare(`SELECT e.* FROM email e WHERE e.user_id=? AND e.account_id=? AND e.email_id>? AND e.email_id>?
         AND e.type=0 ORDER BY e.email_id LIMIT 10`).bind(config.user_id, config.account_id, config.start_email_id, config.scan_email_id).all();
     for (const email of emails) {
@@ -412,7 +431,7 @@ async function reconcileConfig(db, config, options) {
             const existing = await db.prepare('SELECT id FROM parser_job WHERE parser_id=? AND email_id=? LIMIT 1').bind(config.id, email.email_id).first();
             if (!existing) {
                 try {
-                    const result = await addJob(db, config, email, options);
+                    const result = await addJob(c, config, email, options);
                     if (!result.job && !result.match) break;
                 } catch (error) {
                     if (error.code !== 503) throw error;

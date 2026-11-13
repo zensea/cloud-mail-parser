@@ -33,58 +33,65 @@ function settings(params) {
     return downloadOptions({ ...params, range: params.range ?? 'legacy' });
 }
 
-async function owned(db, userId, id) {
+async function owned(c, userId, id) {
+    const db = c.env.db;
     const row = await db.prepare('SELECT * FROM parser_download WHERE id=? AND user_id=?').bind(positiveId(id), userId).first();
     if (!row) throw new BizError('Download link not found', 404);
-    await ownConfig(db, row.parser_id, userId);
+    await ownConfig(c, row.parser_id, userId);
     return row;
 }
 
 export default {
-    async list(db, userId, parserId, secret) {
-        await ownConfig(db, parserId, userId);
+    async list(c, userId, parserId) {
+        const db = c.env.db;
+        await ownConfig(c, parserId, userId);
         const { results } = await db.prepare('SELECT * FROM parser_download WHERE user_id=? AND parser_id=? ORDER BY id DESC').bind(userId, positiveId(parserId)).all();
-        return Promise.all(results.map(async row => ({ ...view(row), path: await pathFor(row, secret) })));
+        return Promise.all(results.map(async row => ({ ...view(row), path: await pathFor(row, c.env.jwt_secret) })));
     },
-    async create(db, userId, params, key) {
-        const config = await ownConfig(db, params.parserId, userId);
+    async create(c, userId, params) {
+        const db = c.env.db;
+        const config = await ownConfig(c, params.parserId, userId);
         const options = settings(params), secret = token(), now = Date.now();
         const row = await db.prepare(`INSERT INTO parser_download
             (parser_id,user_id,name,format,fields_json,table_field,from_time,to_time,batch_size,token_hash,created_at,updated_at,range_mode,timezone_offset,token_encrypted)
             SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM parser_download WHERE parser_id=? AND user_id=?)<20 RETURNING *`)
             .bind(config.id, userId, params.name.trim(), params.format, JSON.stringify(options.fields), options.tableField,
-                options.fromTime, options.toTime, options.size, await hash(secret), now, now, options.range, options.timezoneOffset, await seal(secret, key), config.id, userId).first();
+                options.fromTime, options.toTime, options.size, await hash(secret), now, now, options.range, options.timezoneOffset, await seal(secret, c.env.jwt_secret), config.id, userId).first();
         if (!row) throw new BizError('A rule set can have up to 20 download links; revoke an unused link first', 409);
         return { ...view(row), path: `/parser-download/${secret}` };
     },
-    async update(db, userId, id, params, key) {
-        const current = await owned(db, userId, id);
+    async update(c, userId, id, params) {
+        const db = c.env.db;
+        const current = await owned(c, userId, id);
         if (params.parserId !== undefined && positiveId(params.parserId) !== current.parser_id) throw new BizError('A download link cannot change rule sets', 400);
         const options = settings(params);
         const row = await db.prepare(`UPDATE parser_download SET name=?,format=?,fields_json=?,table_field=?,from_time=?,to_time=?,batch_size=?,range_mode=?,timezone_offset=?,updated_at=?
             WHERE id=? AND user_id=? RETURNING *`).bind(params.name.trim(), params.format, JSON.stringify(options.fields), options.tableField, options.fromTime, options.toTime,
                 options.size, options.range, options.timezoneOffset, Date.now(), current.id, userId).first();
         if (!row) throw new BizError('Download link not found', 404);
-        return { ...view(row), path: await pathFor(row, key) };
+        return { ...view(row), path: await pathFor(row, c.env.jwt_secret) };
     },
-    async file(db, userId, id) {
-        const row = await owned(db, userId, id);
+    async file(c, userId, id) {
+        const row = await owned(c, userId, id);
         const options = view(row);
-        return { data: await parserService.downloadRows(db, userId, options), options };
+        return { data: await parserService.downloadRows(c, userId, options), options };
     },
-    async rotate(db, userId, id, key) {
-        await owned(db, userId, id);
+    async rotate(c, userId, id) {
+        const db = c.env.db;
+        await owned(c, userId, id);
         const secret = token();
         const row = await db.prepare('UPDATE parser_download SET token_hash=?,token_encrypted=?,updated_at=? WHERE id=? AND user_id=? RETURNING *')
-            .bind(await hash(secret), await seal(secret, key), Date.now(), positiveId(id), userId).first();
+            .bind(await hash(secret), await seal(secret, c.env.jwt_secret), Date.now(), positiveId(id), userId).first();
         if (!row) throw new BizError('Download link not found', 404);
         return { ...view(row), path: `/parser-download/${secret}` };
     },
-    async revoke(db, userId, id) {
-        await owned(db, userId, id);
+    async revoke(c, userId, id) {
+        const db = c.env.db;
+        await owned(c, userId, id);
         await db.prepare('DELETE FROM parser_download WHERE id=? AND user_id=?').bind(positiveId(id), userId).run();
     },
-    async download(db, secret, query) {
+    async download(c, secret, query) {
+        const db = c.env.db;
         if (!/^[a-f0-9]{64}$/.test(secret)) throw new BizError('Download link not found', 404);
         const row = await db.prepare(`SELECT d.* FROM parser_download d JOIN parser_config c ON c.id=d.parser_id AND c.user_id=d.user_id
             JOIN account a ON a.account_id=c.account_id AND a.user_id=c.user_id AND a.is_del=0 AND a.status=0
@@ -93,7 +100,7 @@ export default {
         // The bearer URL fixes the rule set and output scope. Only pagination can
         // be chosen by the caller; query parameters cannot widen access.
         const options = view(row);
-        const data = row.range_mode === 'legacy' ? await parserService.exportRows(db, row.user_id, { ...options, cursor: query.cursor }) : await parserService.downloadRows(db, row.user_id, options);
+        const data = row.range_mode === 'legacy' ? await parserService.exportRows(c, row.user_id, { ...options, cursor: query.cursor }) : await parserService.downloadRows(c, row.user_id, options);
         return { data, options };
     }
 };

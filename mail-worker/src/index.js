@@ -34,8 +34,8 @@ export default {
 	email: email,
 	async scheduled(c, env, ctx) {
 		if (c.cron === '* * * * *') {
-			await parserService.tick(env.db, { env });
-			await parserService.cleanup(env.db);
+			await parserService.tick({ env });
+			await parserService.cleanup({ env });
 			return;
 		}
 		if (c.cron === '*/30 * * * *') {
