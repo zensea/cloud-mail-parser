@@ -40,7 +40,7 @@ async function downloadResponse(url, format) {
         return { blob: await response.blob(), filename, nextCursor: response.headers.get('X-Next-Cursor'), hasMore: response.headers.get('X-Has-More') === 'true' };
     }
     const payload = await response.json();
-    if (Array.isArray(payload)) return { blob: new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }), filename };
+    if (Array.isArray(payload)) return { blob: new Blob([JSON.stringify(payload)], { type: 'application/json' }), filename };
     if (payload.code !== 200) throw new Error(payload.message);
-    return { blob: new Blob([JSON.stringify(payload.data, null, 2)], { type: 'application/json' }), filename, ...payload.data };
+    return { blob: new Blob([JSON.stringify(payload.data)], { type: 'application/json' }), filename, ...payload.data };
 }

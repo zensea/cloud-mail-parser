@@ -40,10 +40,9 @@ async function downloadData(c, userId, options, cursor) {
     if (options.format !== 'json-flat') return data;
 
     const emails = new Map();
-    const needsEmail = options.fields.includes('@MessageId') || options.fields.includes('@ReceivdAt');
-    if (needsEmail && data.rows.length) {
+    if (options.fields.includes('@ReceivdAt') && data.rows.length) {
         const ids = [...new Set(data.rows.map(row => row.emailId))];
-        const { results } = await c.env.db.prepare(`SELECT email_id,message_id,create_time FROM email
+        const { results } = await c.env.db.prepare(`SELECT email_id,create_time FROM email
             WHERE user_id=? AND account_id=(SELECT account_id FROM parser_config WHERE id=? AND user_id=?)
             AND email_id IN (SELECT value FROM json_each(?))`).bind(userId, options.parserId, userId, JSON.stringify(ids)).all();
         for (const email of results) emails.set(email.email_id, email);
@@ -51,7 +50,7 @@ async function downloadData(c, userId, options, cursor) {
     data.rows = data.rows.map(row => {
         const email = emails.get(row.emailId);
         const metadata = {
-            '@MessageId': email?.message_id || null,
+            '@MessageId': row.emailId,
             '@ReceivdAt': email?.create_time ?? null,
             '@ProcessedAt': new Date(row.parsedAt).toISOString().slice(0, 19).replace('T', ' ')
         };

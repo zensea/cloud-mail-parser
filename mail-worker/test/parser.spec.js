@@ -964,15 +964,16 @@ describe('simple complete downloads', () => {
         const config = await parserService.saveConfig({ env }, 1, configuration({ rules: [
             { key: 'pin', source: 'text', filters: [{ type: 'regex', pattern: 'PIN: ([0-9]+)', group: 1 }] }
         ] }));
-        await env.db.prepare("UPDATE email SET message_id=?,create_time=?,text='PIN: 009876' WHERE email_id=1")
+        await env.db.prepare("UPDATE email SET message_id=?,create_time=?,text='PIN: 009876' WHERE email_id=2")
             .bind('<pin@example.test>', '2026-01-02 03:04:05').run();
-        const job = await parserService.enqueue({ env }, 1, config.id, 1);
+        const job = await parserService.enqueue({ env }, 1, config.id, 2);
+        expect(job.id).not.toBe(2);
         await parserService.process({ env }, { parserId: config.id });
         await env.db.prepare('UPDATE parser_job SET parsed_at=? WHERE id=?').bind(Date.UTC(2026, 0, 2, 3, 5, 6), job.id).run();
 
         const options = { name: 'PIN', format: 'json-flat', range: 'latest1', fields: ['@MessageId', '@ReceivdAt', '@ProcessedAt', 'pin'] };
         const saved = await link(config, options);
-        const expected = [{ id: '<pin@example.test>', received_at: '2026-01-02 03:04:05', processed_at: '2026-01-02 03:05:06', pin: '009876' }];
+        const expected = [{ id: 2, received_at: '2026-01-02 03:04:05', processed_at: '2026-01-02 03:05:06', pin: '009876' }];
         const response = await publicGet(saved);
         expect(response.headers.get('Content-Disposition')).toContain('.json');
         expect(await response.json()).toEqual(expected);
