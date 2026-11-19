@@ -987,6 +987,23 @@ describe('simple complete downloads', () => {
         expect(await (await publicGet(saved)).json()).toEqual([{ pin: '009876' }]);
     });
 
+    it('counts distinct emails across Last 100 batches and preserves partial results from failed parses', async () => {
+        const config = await fixture();
+        await env.db.batch([
+            env.db.prepare('UPDATE parser_job SET parsed_at=3000 WHERE email_id=230'),
+            env.db.prepare(`INSERT INTO parser_job(parser_id,user_id,account_id,email_id,version,rules_json,input_json,status,result_json,available_at,created_at,updated_at)
+                VALUES (?,1,1,230,2,'[]','{}','failed',?,2000,2000,2000),
+                       (?,1,1,231,1,'[]','null','failed',NULL,1500,1500,1500)`)
+                .bind(config.id, JSON.stringify({ data: { pin: null, value: 0, other: '' } }), config.id)
+        ]);
+        const saved = await link(config, { format: 'json-flat', fields: ['@MessageId', '@ProcessedAt', 'pin', 'value', 'other'] });
+        const rows = await (await publicGet(saved)).json();
+        expect(rows).toHaveLength(100);
+        expect(rows.slice(0, 2)).toEqual([{ id: 230, processed_at: '1970-01-01 00:00:02', value: 0 },
+            { id: 231, processed_at: '1970-01-01 00:00:01' }]);
+        expect(rows.slice(2).map(row => row.id)).toEqual(Array.from({ length: 98 }, (_, index) => 229 - index));
+    });
+
     it('defaults to the latest 100 results, loads internal batches and returns one complete file', async () => {
         const config = await fixture();
         const data = (await file(config)).data;

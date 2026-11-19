@@ -45,6 +45,23 @@ function jobView(row, detail = false) {
         ...(detail ? { rules: JSON.parse(row.rules_json), webhookUrl: row.webhook_url } : {}) };
 }
 
+function exportJobs(format) {
+    if (format !== 'json-flat') return `(SELECT * FROM parser_job WHERE status='parsed')`;
+    // Select the latest completed rule version before applying the time window or cursor.
+    return `(SELECT j.id,j.user_id,j.parser_id,j.email_id,j.version,j.result_json,
+        COALESCE(j.parsed_at,j.updated_at) AS parsed_at FROM parser_job j
+        WHERE j.status IN ('parsed','failed') AND NOT EXISTS (
+            SELECT 1 FROM parser_job newer WHERE newer.parser_id=j.parser_id AND newer.user_id=j.user_id
+            AND newer.email_id=j.email_id AND newer.version>j.version AND newer.status IN ('parsed','failed')
+        ))`;
+}
+
+function exportRow(row, fields) {
+    const data = JSON.parse(row.result_json)?.data ?? {};
+    return { id: row.id, emailId: row.email_id, version: row.version, parsedAt: row.parsed_at,
+        data: fields.length ? Object.fromEntries(fields.filter(key => Object.hasOwn(data, key)).map(key => [key, data[key]])) : data };
+}
+
 export async function ownConfig(c, id, userId) {
     const db = c.env.db;
     const row = await db.prepare(`SELECT ${configFields} FROM parser_config WHERE id = ? AND user_id = ?`).bind(positiveId(id), userId).first();
@@ -251,17 +268,13 @@ const parserService = {
         const [time, id] = cursor.split('_').map(Number);
         if (!Number.isSafeInteger(time) || !Number.isSafeInteger(id)) throw new BizError('Invalid export cursor', 400);
         const { tableField, fields, fromTime, toTime, size } = exportOptions(params);
-        const { results } = await db.prepare(`SELECT * FROM parser_job WHERE user_id=? AND parser_id=? AND status='parsed'
+        const { results } = await db.prepare(`SELECT id,email_id,version,parsed_at,result_json FROM ${exportJobs(params.format)} WHERE user_id=? AND parser_id=?
             AND (?='' OR json_type(result_json,?)='array')
             AND parsed_at>=? AND (?=0 OR parsed_at<=?)
             AND (parsed_at>? OR (parsed_at=? AND id>?)) ORDER BY parsed_at,id LIMIT ?`).bind(userId, parserId, tableField, `$.data.${tableField}`, fromTime, toTime, toTime, time, time, id, size + 1).all();
         const rows = results.slice(0, size);
         const last = rows.at(-1);
-        return { rows: rows.map(row => {
-            const data = JSON.parse(row.result_json).data;
-            return { id: row.id, emailId: row.email_id, version: row.version, parsedAt: row.parsed_at,
-                data: fields.length ? Object.fromEntries(fields.filter(key => Object.hasOwn(data, key)).map(key => [key, data[key]])) : data };
-        }),
+        return { rows: rows.map(row => exportRow(row, fields)),
             hasMore: results.length > size, nextCursor: last ? `${last.parsed_at}_${last.id}` : cursor };
     },
 
@@ -270,6 +283,7 @@ const parserService = {
         const config = await ownConfig(c, params.parserId, userId);
         const options = downloadOptions(params);
         const { fromTime, toTime, limit, limited } = downloadWindow(options);
+        const jobs = exportJobs(params.format);
         const rows = [], encoder = new TextEncoder();
         let beforeTime = toTime, beforeId = Number.MAX_SAFE_INTEGER, bytes = 0;
         // Bound each query and the assembled file. No partially downloaded file
@@ -277,16 +291,14 @@ const parserService = {
         while (true) {
             const size = Math.min(options.tableField ? 10 : 25, limit - rows.length + (limited ? 0 : 1));
             if (!size) break;
-            const { results } = await db.prepare(`SELECT id,email_id,version,parsed_at,result_json FROM parser_job
-                WHERE user_id=? AND parser_id=? AND status='parsed' AND parsed_at>=?
+            const { results } = await db.prepare(`SELECT id,email_id,version,parsed_at,result_json FROM ${jobs}
+                WHERE user_id=? AND parser_id=? AND parsed_at>=?
                 AND (parsed_at<? OR (parsed_at=? AND id<?))
                 AND (?='' OR json_type(result_json,?)='array') ORDER BY parsed_at DESC,id DESC LIMIT ?`)
                 .bind(userId, config.id, fromTime, beforeTime, beforeTime, beforeId, options.tableField, `$.data.${options.tableField}`, size).all();
             for (const result of results) {
                 if (rows.length >= limit) throw new BizError('Download exceeds 1000 results; choose a narrower range', 400);
-                const data = JSON.parse(result.result_json).data;
-                const row = { id: result.id, emailId: result.email_id, version: result.version, parsedAt: result.parsed_at,
-                    data: options.fields.length ? Object.fromEntries(options.fields.filter(key => Object.hasOwn(data, key)).map(key => [key, data[key]])) : data };
+                const row = exportRow(result, options.fields);
                 bytes += encoder.encode(JSON.stringify(row)).byteLength;
                 if (bytes > 4194304) throw new BizError('Download exceeds 4 MiB; choose fewer results or fields', 400);
                 rows.push(row);

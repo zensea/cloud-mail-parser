@@ -57,7 +57,9 @@ async function downloadData(c, userId, options, cursor) {
         const fields = options.fields.length ? options.fields : Object.keys(row.data);
         return Object.fromEntries(fields.flatMap(field => {
             if (Object.hasOwn(metadata, field)) return [[metadataFieldNames[field], metadata[field]]];
-            return Object.hasOwn(row.data, field) ? [[field, row.data[field]]] : [];
+            const value = row.data[field];
+            if (!Object.hasOwn(row.data, field) || value == null || (typeof value === 'string' && !value.trim())) return [];
+            return [[field, value]];
         }));
     });
     return data;
