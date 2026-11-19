@@ -82,11 +82,12 @@ app.get('/parser-download/:token', async c => {
 function exportResponse(c, data, options) {
     let body;
     try {
-        body = options.format === 'csv' ? csvExport(data.rows, options.tableField) : JSON.stringify(result.ok(data));
+        body = options.format === 'csv' ? csvExport(data.rows, options.tableField)
+            : JSON.stringify(options.format === 'json-flat' ? data.rows : result.ok(data));
         checkSize(body, 4194304);
     } catch (error) { throw new BizError(`${error.message}; choose fewer results or fields`, 400); }
     c.header('Content-Type', options.format === 'csv' ? 'text/csv; charset=utf-8' : 'application/json; charset=utf-8');
-    c.header('Content-Disposition', `attachment; filename="parsed-emails-${Number(options.parserId)}.${options.format}"`);
+    c.header('Content-Disposition', `attachment; filename="parsed-emails-${Number(options.parserId)}.${options.format === 'csv' ? 'csv' : 'json'}"`);
     c.header('X-Next-Cursor', data.nextCursor);
     c.header('X-Has-More', String(data.hasMore));
     c.header('Access-Control-Expose-Headers', 'X-Next-Cursor, X-Has-More, Content-Disposition');

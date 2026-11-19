@@ -1,14 +1,22 @@
 import BizError from '../error/biz-error';
 
+export const metadataFieldNames = Object.freeze({
+    '@MessageId': 'id', '@ReceivdAt': 'received_at', '@ProcessedAt': 'processed_at'
+});
+
 export function exportOptions(params) {
     const tableField = params.tableField ?? '';
     const key = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
     if (typeof tableField !== 'string' || (tableField && !key.test(tableField))) throw new BizError('Invalid table export field', 400);
     let fields = params.fields ?? [];
     if (typeof fields === 'string') fields = fields ? fields.split(',') : [];
-    if (!Array.isArray(fields) || fields.length > 30 || fields.some(field => typeof field !== 'string' || !key.test(field)) || new Set(fields).size !== fields.length) {
+    const isMetadata = field => params.format === 'json-flat' && Object.hasOwn(metadataFieldNames, field);
+    if (!Array.isArray(fields) || fields.length > 33 || fields.some(field => typeof field !== 'string' || (!key.test(field) && !isMetadata(field))) ||
+        fields.filter(field => !isMetadata(field)).length > 30 || new Set(fields).size !== fields.length) {
         throw new BizError('Select up to 30 distinct export fields', 400);
     }
+    const names = fields.map(field => isMetadata(field) ? metadataFieldNames[field] : field);
+    if (new Set(names).size !== names.length) throw new BizError('Selected output fields must have different names', 400);
     if (tableField && fields.length && !fields.includes(tableField)) throw new BizError('Include the selected table in export fields', 400);
     const time = value => {
         if (value === undefined || value === null || value === '') return 0;

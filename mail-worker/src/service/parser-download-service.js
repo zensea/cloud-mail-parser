@@ -1,6 +1,6 @@
 import BizError from '../error/biz-error';
 import parserService, { ownConfig, positiveId } from './parser-service';
-import { downloadOptions } from '../lib/parser-export';
+import { downloadOptions, metadataFieldNames } from '../lib/parser-export';
 
 const hex = bytes => Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
 const hash = async token => hex(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token))));
@@ -29,8 +29,39 @@ async function pathFor(row, secret) {
 }
 function settings(params) {
     if (typeof params.name !== 'string' || !params.name.trim() || params.name.length > 80) throw new BizError('Use a download name of 1 to 80 characters', 400);
-    if (!['csv', 'json'].includes(params.format)) throw new BizError('Unsupported export format', 400);
+    if (!['csv', 'json', 'json-flat'].includes(params.format)) throw new BizError('Unsupported export format', 400);
     return downloadOptions({ ...params, range: params.range ?? 'legacy' });
+}
+
+async function downloadData(c, userId, options, cursor) {
+    const data = cursor !== undefined
+        ? await parserService.exportRows(c, userId, { ...options, cursor })
+        : await parserService.downloadRows(c, userId, options);
+    if (options.format !== 'json-flat') return data;
+
+    const emails = new Map();
+    const needsEmail = options.fields.includes('@MessageId') || options.fields.includes('@ReceivdAt');
+    if (needsEmail && data.rows.length) {
+        const ids = [...new Set(data.rows.map(row => row.emailId))];
+        const { results } = await c.env.db.prepare(`SELECT email_id,message_id,create_time FROM email
+            WHERE user_id=? AND account_id=(SELECT account_id FROM parser_config WHERE id=? AND user_id=?)
+            AND email_id IN (SELECT value FROM json_each(?))`).bind(userId, options.parserId, userId, JSON.stringify(ids)).all();
+        for (const email of results) emails.set(email.email_id, email);
+    }
+    data.rows = data.rows.map(row => {
+        const email = emails.get(row.emailId);
+        const metadata = {
+            '@MessageId': email?.message_id || null,
+            '@ReceivdAt': email?.create_time ?? null,
+            '@ProcessedAt': new Date(row.parsedAt).toISOString().slice(0, 19).replace('T', ' ')
+        };
+        const fields = options.fields.length ? options.fields : Object.keys(row.data);
+        return Object.fromEntries(fields.flatMap(field => {
+            if (Object.hasOwn(metadata, field)) return [[metadataFieldNames[field], metadata[field]]];
+            return Object.hasOwn(row.data, field) ? [[field, row.data[field]]] : [];
+        }));
+    });
+    return data;
 }
 
 async function owned(c, userId, id) {
@@ -74,7 +105,7 @@ export default {
     async file(c, userId, id) {
         const row = await owned(c, userId, id);
         const options = view(row);
-        return { data: await parserService.downloadRows(c, userId, options), options };
+        return { data: await downloadData(c, userId, options), options };
     },
     async rotate(c, userId, id) {
         const db = c.env.db;
@@ -100,7 +131,8 @@ export default {
         // The bearer URL fixes the rule set and output scope. Only pagination can
         // be chosen by the caller; query parameters cannot widen access.
         const options = view(row);
-        const data = row.range_mode === 'legacy' ? await parserService.exportRows(c, row.user_id, { ...options, cursor: query.cursor }) : await parserService.downloadRows(c, row.user_id, options);
+        const cursor = row.range_mode === 'legacy' ? query.cursor ?? '' : undefined;
+        const data = await downloadData(c, row.user_id, options, cursor);
         return { data, options };
     }
 };

@@ -8,8 +8,8 @@
     <p class="help">{{ t('parser.downloadLinkHelp') }}</p>
     <el-empty v-if="!links.length" :description="t('parser.noDownloadLinks')" :image-size="60" />
     <article v-for="link in links" :key="link.id" class="download-link">
-      <div><strong>{{ link.name }}</strong> <el-tag size="small">{{ link.format.toUpperCase() }}</el-tag></div>
-      <p class="help">{{ t(`parser.downloadRanges.${link.range}`) }} · {{ link.fields.length ? link.fields.join(', ') : t('parser.downloadAllFields') }}</p>
+      <div><strong>{{ link.name }}</strong> <el-tag size="small">{{ fileFormat(link.format).toUpperCase() }}</el-tag></div>
+      <p class="help">{{ t(`parser.downloadRanges.${link.range}`) }} · {{ link.fields.length ? link.fields.map(field => field.replace(/^@/, '')).join(', ') : t('parser.downloadAllFields') }}</p>
       <div class="actions">
         <el-button size="small" @click="downloadSaved(link)">{{ t('parser.downloadNow') }}</el-button>
         <el-button size="small" @click="copyLink(link)">{{ t('parser.copyDownloadLink') }}</el-button>
@@ -20,7 +20,7 @@
     </article>
     <el-dialog v-model="showEditor" :title="t(editingId ? 'parser.editDownloadLink' : 'parser.createDownloadLink')" width="min(640px, 94vw)" :close-on-click-modal="!busy" :show-close="!busy">
       <el-form label-position="top" @submit.prevent="saveLink"><el-form-item :label="t('parser.downloadName')" for="download-name"><el-input id="download-name" v-model="editor.name" maxlength="80" /></el-form-item></el-form>
-      <download-options v-if="showEditor" :model-value="editor" :key="editorKey" :rules="rules" prefix="link-download" />
+      <download-options v-if="showEditor" :model-value="editor" :key="editorKey" :rules="rules" prefix="link-download" fixed-link />
       <template #footer><el-button :disabled="busy" @click="showEditor = false">{{ t('parser.cancel') }}</el-button><el-button type="primary" :loading="busy" @click="saveLink">{{ t('parser.saveDownloadLink') }}</el-button></template>
     </el-dialog>
     <el-dialog v-model="showUrl" :title="t('parser.copyDownloadLink')" width="min(640px, 94vw)" @closed="freshUrl = ''"><el-input v-model="freshUrl" readonly type="textarea" :rows="3" :aria-label="t('parser.downloadUrl')" /><p>{{ t('parser.downloadCopyManually') }}</p></el-dialog>
@@ -35,7 +35,8 @@ import { parserDownloadFile, parserDownloadLinks, parserCreateDownload, parserUp
 const props = defineProps({ parserId: { type: Number, required: true }, rules: { type: Array, required: true } });
 const emit = defineEmits(['busy']);
 const { t } = useI18n();
-const defaults = () => ({ name: '', format: 'csv', range: 'latest100', fieldMode: 'all', fields: [], timeRange: null, tableField: '', timezoneOffset: new Date().getTimezoneOffset() });
+const defaults = () => ({ name: '', format: 'csv', range: 'latest100', fieldMode: 'all', fields: [], timeRange: null, tableField: '', timezoneOffset: new Date().getTimezoneOffset(), legacyJson: false });
+const fileFormat = format => format === 'json-flat' ? 'json' : format;
 const manual = reactive(defaults()), editor = reactive(defaults());
 const busy = ref(false), links = ref([]), showEditor = ref(false), editingId = ref(0), editorKey = ref(0), showUrl = ref(false), freshUrl = ref('');
 function payload(form) {
@@ -53,7 +54,7 @@ async function run(action) {
 const loadLinks = async () => { links.value = await parserDownloadLinks(props.parserId); };
 function openEditor(link) {
   editingId.value = link?.id || 0; editorKey.value++;
-  Object.assign(editor, defaults(), link ? { name: link.name, format: link.format, range: link.range, fields: [...link.fields],
+  Object.assign(editor, defaults(), link ? { name: link.name, format: fileFormat(link.format), legacyJson: link.format === 'json', range: link.range, fields: [...link.fields],
     fieldMode: link.fields.length ? 'selected' : 'all', tableField: link.tableField, timezoneOffset: link.timezoneOffset,
     timeRange: link.fromTime || link.toTime ? [link.fromTime || 0, link.toTime || Date.now()] : null } : {});
   showEditor.value = true;
@@ -61,6 +62,7 @@ function openEditor(link) {
 async function saveLink() {
   await run(async () => {
     const options = payload(editor);
+    if (options.format === 'json' && (!editor.legacyJson || options.fields.some(field => field.startsWith('@')))) options.format = 'json-flat';
     if (editingId.value) await parserUpdateDownload(editingId.value, options);
     else await parserCreateDownload(options);
     showEditor.value = false; await loadLinks();
@@ -95,7 +97,7 @@ async function saveFile(options) {
   document.body.appendChild(anchor); anchor.click(); anchor.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 async function downloadManual() { await run(() => saveFile(payload(manual))); }
-async function downloadSaved(link) { await run(() => saveFile({ downloadId: link.id, format: link.format })); }
+async function downloadSaved(link) { await run(() => saveFile({ downloadId: link.id, format: fileFormat(link.format) })); }
 onMounted(() => run(loadLinks));
 </script>
 <style scoped>

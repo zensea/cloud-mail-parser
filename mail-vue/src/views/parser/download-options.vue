@@ -20,6 +20,7 @@
           </el-form-item>
           <el-form-item v-if="form.fieldMode === 'selected'" :label="t('parser.downloadSelectedFields')" :for="`${prefix}-fields`">
             <el-select :id="`${prefix}-fields`" v-model="form.fields" multiple filterable allow-create default-first-option>
+              <el-option v-for="field in metadataFields" :key="field" :value="`@${field}`" :label="field" />
               <el-option v-for="rule in rules" :key="rule.key" :value="rule.key" :label="rule.key" />
             </el-select>
           </el-form-item>
@@ -40,13 +41,17 @@
 <script setup>
 import { computed, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
-const props = defineProps({ modelValue: { type: Object, required: true }, rules: { type: Array, required: true }, prefix: { type: String, required: true } });
+const props = defineProps({ modelValue: { type: Object, required: true }, rules: { type: Array, required: true }, prefix: { type: String, required: true }, fixedLink: Boolean });
 const { t } = useI18n();
 const form = computed(() => props.modelValue), advanced = ref([]);
 const ranges = computed(() => ['latest1', 'latest100', 'latest1000', 'today', 'last7days', 'all', 'custom', ...(form.value.range === 'legacy' ? ['legacy'] : [])]);
 const tableRules = computed(() => props.rules.filter(rule => ['htmlTable', 'csvAttachment'].includes(rule.source)));
+const metadataFields = computed(() => props.fixedLink && form.value.format === 'json' ? ['MessageId', 'ReceivdAt', 'ProcessedAt'] : []);
 const configured = computed(() => form.value.fieldMode === 'selected' || (form.value.format === 'csv' && !!form.value.tableField) || ['custom', 'legacy'].includes(form.value.range));
 watch(() => form.value.range, range => { if (['custom', 'legacy'].includes(range)) advanced.value = ['options']; }, { immediate: true });
+watch(() => form.value.format, format => {
+  if (props.fixedLink && format === 'csv') form.value.fields = form.value.fields.filter(field => !field.startsWith('@'));
+});
 watch([() => form.value.tableField, () => form.value.fieldMode], ([field, mode]) => {
   if (field && mode === 'selected' && !form.value.fields.includes(field)) form.value.fields.push(field);
 });
