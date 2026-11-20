@@ -13,6 +13,7 @@ import telegramService from '../service/telegram-service';
 import aiService from '../service/ai-service';
 import webhookService from '../service/webhook-service';
 import parserService from '../service/parser-service';
+import { notifyMailWs } from '../websocket/notify';
 
 export async function email(message, env, ctx) {
 
@@ -163,9 +164,12 @@ export async function email(message, env, ctx) {
 
 		emailRow = await emailService.completeReceive({ env }, account ? emailConst.status.RECEIVE : emailConst.status.NOONE, emailRow.emailId);
 
+		// 有账号才推个人收件箱；无人收件（无 account / userId=0）只推全部邮件。
+		notifyMailWs(env, ctx, emailRow);
+
 		// The durable job is registered before the email event finishes. Cron repairs gaps.
 		try {
-            if (await parserService.receive({ env }, emailRow, { attachments })) {
+			if (await parserService.receive({ env }, emailRow, { attachments })) {
 				ctx.waitUntil(parserService.process({ env }, { userId: emailRow.userId })
 					.catch(error => console.error('Parser background task failed', error)));
 			}
@@ -173,15 +177,13 @@ export async function email(message, env, ctx) {
 			console.error('Parser enqueue failed; initialize the parser schema if needed', error);
 		}
 
-
 		if (ruleType === settingConst.ruleType.RULE) {
-
-			const emails = ruleEmail.split(',');
-
-			if (!emails.includes(message.to)) {
+			if (!emailService.matchForwardRule({
+				ruleEmail,
+				userEmail: userRow?.email
+			})) {
 				return;
 			}
-
 		}
 
 		//转发到TG
