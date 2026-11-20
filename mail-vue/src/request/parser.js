@@ -20,27 +20,17 @@ export function parserDownloadUrl(path) {
     return new URL(`${base}${path}`, window.location.origin).toString();
 }
 
-export async function parserDownload(parserId, format, cursor, tableField = '', size = 100, options = {}) {
-    const url = new URL(parserDownloadUrl('/parser/export'));
-    url.search = new URLSearchParams({ ...options, fields: (options.fields || []).join(','), parserId, format, cursor, tableField, size });
-    return downloadResponse(url, format);
-}
-
-export function parserDownloadFile(options) {
+export async function parserDownloadFile(options) {
     const url = new URL(parserDownloadUrl('/parser/download'));
     url.search = new URLSearchParams({ ...options, fields: (options.fields || []).join(',') });
-    return downloadResponse(url, options.format);
-}
-
-async function downloadResponse(url, format) {
     const response = await fetch(url, { headers: { Authorization: localStorage.getItem('token') || '' }, cache: 'no-store' });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const filename = response.headers.get('Content-Disposition')?.match(/filename="([^"]+)"/)?.[1];
     if (response.headers.get('Content-Type')?.includes('text/csv')) {
-        return { blob: await response.blob(), filename, nextCursor: response.headers.get('X-Next-Cursor'), hasMore: response.headers.get('X-Has-More') === 'true' };
+        return { blob: await response.blob(), filename };
     }
     const payload = await response.json();
-    if (Array.isArray(payload)) return { blob: new Blob([JSON.stringify(payload)], { type: 'application/json' }), filename };
-    if (payload.code !== 200) throw new Error(payload.message);
-    return { blob: new Blob([JSON.stringify(payload.data)], { type: 'application/json' }), filename, ...payload.data };
+    const flat = Array.isArray(payload);
+    if (!flat && payload.code !== 200) throw new Error(payload.message);
+    return { blob: new Blob([JSON.stringify(flat ? payload : payload.data)], { type: 'application/json' }), filename };
 }

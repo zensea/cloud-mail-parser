@@ -312,23 +312,21 @@ const parserService = {
     async cleanup(c) {
         const db = c.env.db;
         // Keep identifiers for deduplication: deleting rows would resend old mail on reconciliation.
-        const { results } = await db.prepare(`SELECT j.id FROM parser_job j JOIN parser_config c ON c.id=j.parser_id
+        const eligibleJobs = `SELECT j.id FROM parser_job j JOIN parser_config c ON c.id=j.parser_id
             WHERE c.retention_days>0 AND j.updated_at < ?-c.retention_days*86400000
-            AND (j.status='failed' OR (j.status='parsed' AND j.dispatch_status IN ('none','sent','failed')))
-            ORDER BY j.updated_at,j.id LIMIT 50`).bind(Date.now()).all();
+            AND (j.status='failed' OR (j.status='parsed' AND j.dispatch_status IN ('none','sent','failed')))`;
+        const { results } = await db.prepare(`${eligibleJobs} ORDER BY j.updated_at,j.id LIMIT 50`).bind(Date.now()).all();
         if (!results.length) return 0;
         const ids = results.map(row => row.id);
         const placeholders = ids.map(() => '?').join(',');
         // Recheck eligibility inside the atomic batch in case a retry won the race.
-        const eligible = `SELECT j.id FROM parser_job j JOIN parser_config c ON c.id=j.parser_id
-            WHERE j.id IN (${placeholders}) AND c.retention_days>0 AND j.updated_at < ?-c.retention_days*86400000
-            AND (j.status='failed' OR (j.status='parsed' AND j.dispatch_status IN ('none','sent','failed')))`;
+        const selectedJobs = `${eligibleJobs} AND j.id IN (${placeholders})`;
         const now = Date.now();
         const batch = await db.batch([
-            db.prepare(`DELETE FROM parser_delivery WHERE job_id IN (${eligible})`).bind(...ids, now),
+            db.prepare(`DELETE FROM parser_delivery WHERE job_id IN (${selectedJobs})`).bind(now, ...ids),
             db.prepare(`UPDATE parser_job SET status='expired',input_json='null',rules_json='[]',result_json=NULL,
                 webhook_url='',webhook_secret='',error='',dispatch_error='',dispatch_status='none',updated_at=?
-                WHERE id IN (${eligible})`).bind(now, ...ids, now)
+                WHERE id IN (${selectedJobs})`).bind(now, now, ...ids)
         ]);
         return batch[1].meta.changes;
     },

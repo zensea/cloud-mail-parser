@@ -43,7 +43,6 @@ async function storedCsv(c, file) {
 export async function readEmailInput(c, row, rules, { attachments } = {}) {
     const db = c.env.db;
     const names = [...new Set(validateRules(rules).filter(rule => rule.source === 'csvAttachment').map(rule => rule.options.attachmentName))];
-    if (names.length > 5) throw new Error('Use at most 5 CSV attachments per email');
     const files = [];
     if (names.length) {
         const metadata = attachments ?? (await db.prepare(`SELECT filename, key, size FROM attachments

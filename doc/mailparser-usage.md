@@ -93,7 +93,7 @@ CSV 支持逗号、分号、制表符，支持引号内分隔符、换行及双�
 
 ## 导出与数据保留
 
-下载仅包含成功解析的结果，默认最近 100 条、全部字段。页面一次生成完整文件，内部读取与合并批次；CSV 只包含一个表头。原接口 `/api/parser/export?parserId=...&format=json&cursor=...` 继续用于认证后的分批取数，保留按完成时间和任务 ID 排序的游标契约。
+手动下载和 CSV 下载包含成功解析的结果。页面一次生成完整文件，CSV 只包含一个表头。原接口 `/api/parser/export?parserId=...&format=json&cursor=...` 继续用于认证后的分批取数，保留按完成时间和任务 ID 排序的游标契约。
 
 CSV 使用 UTF-8 BOM、引号转义及公式防护。默认按邮件导出，表格字段为 JSON 文本；选择“CSV 明细字段”后按选定表格逐行展开，列名为 `字段名.列名`，重复写入任务、邮件编号、版本和其他字段。空表没有明细行，不包含该表格字段的旧版本结果跳过。一次只展开一个表格，避免多个数组产生组合行；其他表格保持 JSON。JSON 下载不受明细选择影响。
 
@@ -101,26 +101,30 @@ CSV 使用 UTF-8 BOM、引号转义及公式防护。默认按邮件导出，表
 
 ### 手动下载与固定下载链接
 
-选择已保存的规则集，打开“下载”页签，选择 CSV / JSON 和结果范围后点击“下载”。默认下载最近 100 条成功结果及全部字段，也可选择最近 1 / 1000 条、今天、近 7 天、全部已保留结果或自定义时间。按解析完成时间及任务编号从新到旧排序，同一邮件不同规则版本的成功结果分别计数。“今天”按浏览器在保存配置时的 UTC 偏移计算；近 7 天为滚动 168 小时。固定链接每次访问时重新计算相对时间范围。
+选择已保存的规则集，打开“下载”页签，选择 CSV / JSON 和结果范围后点击“下载”。默认下载最近 100 条成功结果及全部字段，也可选择最近 1 / 1000 条、今天、近 7 天、全部已保留结果或自定义时间。手动下载按解析完成时间从新到旧排序，同一邮件不同规则版本的成功结果分别计数。“今天”按配置时的浏览器 UTC 偏移计算。近 7 天为滚动 168 小时。固定链接每次访问时重新计算相对时间范围。
 
 “高级设置”默认折叠，可切换为“指定字段”，选择字段或输入历史键名；选择自定义时间时自动展开日期输入。CSV 配置包含表格规则时才显示明细字段。已设置的高级条件在折叠后仍然生效，标题会提示已设置；批次数量、分页游标无需在页面配置。“处理结果”页的“下载结果”按钮直接进入此页面。
 
-点击“创建固定链接”，在独立弹窗中填写名称，选择格式与范围后保存。创建默认仍为 CSV、最近 100 条、全部字段，不会继承刚才手动下载的临时选择。每套规则集最多 20 个链接，列表直接提供下载、复制、编辑和撤销，并保留重新生成入口。编辑改变设置并保持 URL 不变。固定链接为 `https://部署域名/api/parser-download/<令牌>`，无需登录、JWT 或全局公共密钥；任何持有者都能下载该链接范围内的成功结果。访问不触发邮件解析或 Webhook，也不删除结果。
+点击“创建固定链接”，在弹窗中填写名称，选择格式与范围后保存。默认使用 CSV、最近 100 条、全部字段。每套规则集最多 20 个链接，可下载、复制、编辑、撤销或重新生成。编辑设置保持 URL 不变。任何持有 `https://部署域名/api/parser-download/<令牌>` 的人都能下载保存范围内的结果。访问链接不触发解析、Webhook 或结果删除。
 
 令牌使用 256 位安全随机数，以 SHA-256 摘要验证公开访问，同时使用 AES-GCM 加密保存可恢复副本，密钥由部署的 `jwt_secret` 派生。只有经过原有会话和归属验证的管理接口才返回完整 URL，因此刷新后仍可复制。接口不返回摘要或加密内容，数据库不保存明文令牌。重新生成保留下载设置并立即使旧令牌失效；撤销删除该链接。已开始返回的响应不会被中断。下载响应禁止缓存并设置 `Referrer-Policy: no-referrer`。
 
-新建页面生成的链接每次返回所选范围内的完整结果，不维护“自上次下载后”的共享进度。调用方不能通过规则集、字段、时间、格式、范围或游标参数扩大访问范围。公开 JSON 响应沿用 `{ code, message, data: { rows, hasMore, nextCursor } }`，完整文件的 `hasMore=false`；CSV 返回单个附件。两种格式都带附件文件名，JSON 下载到本地的文件保留 `rows` 等数据结构。
+新版固定 JSON 链接返回单行数组。每封已处理的邮件只取最新保留的已完成规则版本，包含失败的解析结果。未提取到的字段省略，其他字段照常输出。选择“最近 100 条”时，按处理完成时间从新到旧返回最多 100 封邮件。
+
+在“高级设置 → 指定字段”可勾选 `MessageId`、`ReceivdAt`、`ProcessedAt`，分别输出 `id`（整数 `email_id`）、`received_at`、`processed_at`。时间采用 UTC。选择“全部字段”时输出规则字段。
+
+完整下载每次返回所选范围内的完整文件。旧 JSON 链接（`format=json`）继续使用 `{ code, message, data: { rows, hasMore, nextCursor } }`。调用方不能通过查询参数扩大固定链接的访问范围。
 
 ```javascript
 // 示例 URL 中的令牌为占位符；使用自己创建的 JSON 下载链接。
 const downloadUrl = 'https://your-domain.example/api/parser-download/REPLACE_WITH_TOKEN';
 const response = await fetch(downloadUrl, { cache: 'no-store' });
 if (!response.ok) throw new Error(`Download failed: HTTP ${response.status}`);
-const { data } = await response.json();
-console.log(data.rows); // 替换为自己的存储或处理逻辑
+const rows = await response.json();
+console.log(rows); // 新版固定 JSON 下载返回数组
 ```
 
-链接管理 API 为 `GET /api/parser/download-links?parserId=...`、`POST /api/parser/download-links`、`PUT /api/parser/download-links/:id`、`POST /api/parser/download-links/:id/rotate`、`DELETE /api/parser/download-links/:id`，均要求原有登录会话并验证归属。创建 / 完整更新参数包括 `parserId`、`name`、`format`、`range`，以及可选的 `fields` 数组、`fromTime` / `toTime`（含边界的毫秒时间戳）、`tableField`、`timezoneOffset`（浏览器 `getTimezoneOffset()` 值）。`range` 支持 `latest1`、`latest100`、`latest1000`、`today`、`last7days`、`all`、`custom`；自定义时间须包含起止时间。
+链接管理 API 为 `GET /api/parser/download-links?parserId=...`、`POST /api/parser/download-links`、`PUT /api/parser/download-links/:id`、`POST /api/parser/download-links/:id/rotate`、`DELETE /api/parser/download-links/:id`，均要求原有登录会话并验证归属。创建或完整更新参数包括 `parserId`、`name`、`format`、`range`，以及可选的 `fields`、`fromTime` / `toTime`（毫秒时间戳）、`tableField`、`timezoneOffset`（浏览器 `getTimezoneOffset()` 值）。新版固定 JSON 使用 `format=json-flat`，对应的内置字段键为 `@MessageId`、`@ReceivdAt`、`@ProcessedAt`。`range` 支持 `latest1`、`latest100`、`latest1000`、`today`、`last7days`、`all`、`custom`，自定义时间须包含起止时间。
 
 认证后的完整下载接口为 `GET /api/parser/download?parserId=...&format=csv&range=latest100`，也可用 `downloadId` 按保存设置下载。原分批导出接口 `/api/parser/export` 保持兼容。升级初始化补充 `range_mode`、`timezone_offset` 和 `token_encrypted`；旧配置与未传 `range` 的旧创建请求仍使用 `legacy` 分批行为，公开链接继续接受 `cursor`。只有摘要的旧链接及更换 `jwt_secret` 后无法解密的链接仍可访问；再次复制时会提示明确重新生成，旧 URL 随后失效。应保留原密钥以避免不必要的重新生成。
 
