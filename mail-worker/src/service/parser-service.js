@@ -292,8 +292,8 @@ const parserService = {
             const size = Math.min(options.tableField ? 10 : 25, limit - rows.length + (limited ? 0 : 1));
             if (!size) break;
             const { results } = await db.prepare(`SELECT id,email_id,version,parsed_at,result_json FROM ${jobs}
-                WHERE user_id=? AND parser_id=? AND parsed_at>=?
-                AND (parsed_at<? OR (parsed_at=? AND id<?))
+                WHERE user_id=? AND parser_id=? AND parsed_at>=? AND parsed_at<=?
+                AND (parsed_at<? OR id<?)
                 AND (?='' OR json_type(result_json,?)='array') ORDER BY parsed_at DESC,id DESC LIMIT ?`)
                 .bind(userId, config.id, fromTime, beforeTime, beforeTime, beforeId, options.tableField, `$.data.${options.tableField}`, size).all();
             for (const result of results) {

@@ -990,6 +990,7 @@ describe('simple complete downloads', () => {
     it('counts distinct emails across Last 100 batches and preserves partial results from failed parses', async () => {
         const config = await fixture();
         await env.db.batch([
+            env.db.prepare('UPDATE parser_job SET parsed_at=1000 WHERE parser_id=?').bind(config.id),
             env.db.prepare('UPDATE parser_job SET parsed_at=3000 WHERE email_id=230'),
             env.db.prepare(`INSERT INTO parser_job(parser_id,user_id,account_id,email_id,version,rules_json,input_json,status,result_json,available_at,created_at,updated_at)
                 VALUES (?,1,1,230,2,'[]','{}','failed',?,2000,2000,2000),

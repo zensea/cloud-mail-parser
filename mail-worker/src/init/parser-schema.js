@@ -29,6 +29,7 @@ export const parserSchema = [
     )`,
     `CREATE INDEX IF NOT EXISTS idx_parser_job_owner ON parser_job(user_id, parser_id, id)`,
     `CREATE INDEX IF NOT EXISTS idx_parser_job_export ON parser_job(user_id, parser_id, status, parsed_at, id)`,
+    `CREATE INDEX IF NOT EXISTS idx_parser_job_flat_export ON parser_job(user_id, parser_id, COALESCE(parsed_at, updated_at), id) WHERE status IN ('parsed','failed')`,
     `CREATE INDEX IF NOT EXISTS idx_parser_job_parse ON parser_job(status, available_at, lease_until)`,
     `CREATE INDEX IF NOT EXISTS idx_parser_job_dispatch ON parser_job(dispatch_status, dispatch_available_at, dispatch_lease_until)`,
     `CREATE INDEX IF NOT EXISTS idx_parser_job_retention ON parser_job(status, updated_at)`,
